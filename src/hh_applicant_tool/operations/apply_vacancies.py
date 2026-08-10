@@ -85,6 +85,7 @@ class Namespace(BaseNamespace):
     max_responses: int
     send_email: bool
     skip_tests: bool
+    context_dir: Path | None
 
 
 class Operation(BaseOperation):
@@ -142,6 +143,12 @@ class Operation(BaseOperation):
             "--prompt",
             help="Промпт для генерации сопроводительного письма",
             default="Сгенерируй сопроводительное письмо не более 5-7 предложений от моего имени для вакансии",  # noqa: E501
+        )
+        parser.add_argument(
+            "--context-dir",
+            help="Директория с файлами контекста пользователя (*.md). Содержимое всех *.md файлов добавляется в системный промпт AI, чтобы ответы на вопросы тестов и письма были персонализированными (профиль, навыки, зарплатные ожидания, формат работы и т.п.).",
+            type=Path,
+            default=None,
         )
         parser.add_argument(
             "--total-pages",
@@ -358,8 +365,20 @@ class Operation(BaseOperation):
         self.sort_point_lng = args.sort_point_lng
         self.top_lat = args.top_lat
         self.total_pages = args.total_pages
+        # Загружаем пользовательский контекст (*.md) и добавляем его в системный
+        # промпт AI, чтобы ответы на вопросы тестов и письма были
+        # персонализированными
+        self._user_context = self._load_user_context(args.context_dir)
+        system_prompt = args.system_prompt
+        if self._user_context:
+            system_prompt += (
+                "\n\nИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ "
+                "(обязательно используй эти данные для персонализации "
+                "своих ответов):\n" + self._user_context
+            )
+            logger.debug("Системный промпт с контекстом пользователя: %r", system_prompt)
         self.cover_letter_ai = (
-            tool.get_cover_letter_ai(args.system_prompt)
+            tool.get_cover_letter_ai(system_prompt)
             if args.use_ai
             else None
         )
@@ -371,6 +390,48 @@ class Operation(BaseOperation):
 
     def _get_full_resume(self, resume_id: str) -> dict:
         return self.api_client.get(f"/resumes/{resume_id}")
+
+    def _load_user_context(self, context_dir: Path | None) -> str:
+        """Загружает пользовательский контекст из всех *.md файлов директории.
+
+        Содержимое файлов объединяется в один блок, который затем добавляется
+        в системный промпт AI-клиента для персонализации ответов.
+        """
+        if not context_dir:
+            return ""
+        if not context_dir.is_dir():
+            logger.warning(
+                "Директория контекста не найдена: %s", context_dir
+            )
+            return ""
+
+        parts = []
+        for md_file in sorted(context_dir.glob("*.md")):
+            try:
+                content = md_file.read_text(encoding="utf-8").strip()
+            except OSError as ex:
+                logger.warning(
+                    "Не удалось прочитать файл контекста %s: %s",
+                    md_file,
+                    ex,
+                )
+                continue
+            if content:
+                parts.append(f"--- {md_file.name} ---\n{content}")
+                logger.debug(
+                    "Загружен файл контекста: %s (%d символов)",
+                    md_file.name,
+                    len(content),
+                )
+
+        context = "\n\n".join(parts)
+        if context:
+            logger.info(
+                "Загружен пользовательский контекст из %d файлов (%d символов)",
+                len(parts),
+                len(context),
+            )
+        return context
 
     def _analyze_resume_heavy(self, resume: dict) -> str:
         resume_id = resume.get("id")
@@ -1239,6 +1300,14 @@ class Operation(BaseOperation):
         test_data = tests_data.get(str(vacancy_id))
         if not test_data:
             raise ValueError(f"Пустые данные теста вакансии vacancy_id={vacancy_id}")
+        # ВАЛИДАЦИЯ: в метод передаются только vacancy_id/resume_hash/letter;
+        # пользовательский контекст приходит через системный промпт AI-клиента
+        logger.debug(
+            "ВАЛИДАЦИЯ _solve_vacancy_test получил: vacancy_id=%r resume_hash=%r letter_len=%d (пользовательский контекст — через системный промпт AI)",
+            vacancy_id,
+            resume_hash,
+            len(letter or ""),
+        )
         ## logger.debug(f"{test_data = }") ## убираем отладку
 
         payload: dict[str, Any] = {
@@ -1276,6 +1345,8 @@ class Operation(BaseOperation):
                         f"Варианты:\n{options}\n"
                         f"Выбери ID правильного ответа. Пришли только ID."
                     )
+                    # ВАЛИДАЦИЯ: промпт для выбора ответа тоже без контекста пользователя
+                    logger.debug("ВАЛИДАЦИЯ промпт теста (выбор ID): %r", prompt)
                     ai_answer = self.cover_letter_ai.complete(prompt).strip()
                     # Ищем ID в ответе AI на случай лишнего текста
                     match = re.search(r"\d+", ai_answer)
@@ -1309,6 +1380,13 @@ class Operation(BaseOperation):
                     )
                 elif self.cover_letter_ai:
                     prompt = f"Дай краткий и профессиональный ответ на вопрос: {question}"
+                    # ВАЛИДАЦИЯ: проверяем, содержит ли промпт контекст пользователя
+                    user_context = getattr(self, "_user_context", "") or ""
+                    logger.debug(
+                        "ВАЛИДАЦИЯ промпт теста (контекст пользователя = %s): %r",
+                        "ЕСТЬ" if user_context else "НЕТ",
+                        prompt,
+                    )
                     answer = self.cover_letter_ai.complete(prompt)
                     ## добавляем ответ AI на вопрос теста##
                     logger.debug("AI ответ= %r", answer)

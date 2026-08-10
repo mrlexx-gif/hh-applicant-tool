@@ -120,6 +120,9 @@ class ChatOpenAI:
         # Логирование запроса к AI при DEBUG уровне
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("AI запрос: %s", message)
+            # ВАЛИДАЦИЯ: показываем полный payload (system+user),
+            # чтобы проверить, какой контекст пользователя реально уходит в AI
+            logger.debug("AI полные messages (system+user): %r", messages)
 
         payload = {
             "model": self.model,

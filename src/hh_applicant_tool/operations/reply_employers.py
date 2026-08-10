@@ -4,6 +4,7 @@ import argparse
 import logging
 import random
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..ai.base import AIError
@@ -38,6 +39,7 @@ class Namespace(BaseNamespace):
     system_prompt: str
     message_prompt: str
     period: int
+    context_dir: Path | None
 
 
 class Operation(BaseOperation):
@@ -100,6 +102,12 @@ class Operation(BaseOperation):
             help="Промпт для генерации сообщения",
             default="Напиши короткий ответ работодателю на основе истории переписки.",
         )
+        parser.add_argument(
+            "--context-dir",
+            help="Директория с файлами контекста пользователя (*.md). Содержимое всех *.md файлов добавляется в системный промпт AI для персонализации ответов.",
+            type=Path,
+            default=None,
+        )
 
     def run(self, tool: HHApplicantTool, args: Namespace) -> None:
         self.tool = tool
@@ -114,12 +122,60 @@ class Operation(BaseOperation):
         self.only_invitations = args.only_invitations
 
         self.message_prompt = args.message_prompt
+        # Загружаем пользовательский контекст (*.md) и добавляем его в системный
+        # промпт AI для персонализации ответов
+        self._user_context = self._load_user_context(args.context_dir)
+        system_prompt = args.system_prompt
+        if self._user_context:
+            system_prompt += (
+                "\n\nИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ "
+                "(обязательно используй эти данные для персонализации "
+                "своих ответов):\n" + self._user_context
+            )
         self.cover_letter_ai = (
-            tool.get_cover_letter_ai(args.system_prompt)
+            tool.get_cover_letter_ai(system_prompt)
             if args.use_ai
             else None
         )
         self.period = args.period
+
+    def _load_user_context(self, context_dir: Path | None) -> str:
+        """Загружает пользовательский контекст из всех *.md файлов директории."""
+        if not context_dir:
+            return ""
+        if not context_dir.is_dir():
+            logger.warning(
+                "Директория контекста не найдена: %s", context_dir
+            )
+            return ""
+
+        parts = []
+        for md_file in sorted(context_dir.glob("*.md")):
+            try:
+                content = md_file.read_text(encoding="utf-8").strip()
+            except OSError as ex:
+                logger.warning(
+                    "Не удалось прочитать файл контекста %s: %s",
+                    md_file,
+                    ex,
+                )
+                continue
+            if content:
+                parts.append(f"--- {md_file.name} ---\n{content}")
+                logger.debug(
+                    "Загружен файл контекста: %s (%d символов)",
+                    md_file.name,
+                    len(content),
+                )
+
+        context = "\n\n".join(parts)
+        if context:
+            logger.info(
+                "Загружен пользовательский контекст из %d файлов (%d символов)",
+                len(parts),
+                len(context),
+            )
+        return context
 
         logger.debug(f"{self.reply_message = }")
         return self.reply_employers()
