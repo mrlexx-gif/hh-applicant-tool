@@ -135,9 +135,10 @@ class Operation(BaseOperation):
                     )
 
                     print(
-                        "❌ Отменили отклик на вакансию:",
-                        vacancy["alternate_url"],
-                        vacancy["name"],
+                        "❌ Отменили отклик на вакансию;",
+                        vacancy["alternate_url"] + ";",
+                        vacancy["name"] + ";",
+                        vacancy["employer"]["name"] ##add employer name to the print statement##
                     )
 
                 if self.args.delete_chat:
