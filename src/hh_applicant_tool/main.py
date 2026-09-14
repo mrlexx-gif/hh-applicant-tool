@@ -338,30 +338,23 @@ class HHApplicantTool(MegaTool):
         if response.status_code != 200:
             raise Error(f"Неожиданный код ответа: {response.status_code} {response.url}")
 
-        text = response.text
-
-        # HH периодически меняет разметку initial-state блока.
-        # Раньше: <template id="HH-Lux-InitialState1">, теперь:
-        # <template style="display:none" id="HH-Lux-InitialState">{...}</template>.
-        # Ищем блок устойчиво к порядку атрибутов и варианту id.
-        match = re.search(
-            r'<template[^>]*id="HH-Lux-InitialState\d?"[^>]*>(.*?)</template>',
-            text,
-            re.S,
-        )
-        if not match:
-            raise Error(
-                f"Блок HH-Lux-InitialState не найден в теле ответа. "
-                f"url={response.url} status={response.status_code} "
-                f"content_type={response.headers.get('Content-Type')} "
-                f"body_len={len(text)} has_redirectConfig={'redirectConfig' in text} "
-                f"snippet={text[:300]!r}"
-            )
-
-        # Содержимое initial-state закодировано HTML-сущностями (&#34; и т.п.)
-        config = html.unescape(match.group(1))
-        config = json.loads(config)
-
+        try:
+            raw_config = response.text.split('id="HH-Lux-InitialState">')[1].split('</template>')[0]
+        except IndexError:
+            raise Error(f"Template with config not found on {response.url}")
+        
+        # Теперь кавычки всегда превращаются в сущности?
+        if raw_config.startswith('{&#34;'):
+           raw_config = html.unescape(raw_config)
+            
+        # import tempfile
+        # with tempfile.NamedTemporaryFile('w', delete=False, prefix='hh_config_', suffix='.json', dir='.', encoding='utf-8') as tmp_file:
+        #     tmp_file.write(raw_config)
+        #     file_path = tmp_file.name
+        #     print(file_path)
+        
+        config = json.loads(raw_config)
+        assert type(config) is dict
         assert "redirectConfig" in config
         if check_auth and not self._is_authenticated(config):
             raise Error("Авторизация истекла требуется новая!")
