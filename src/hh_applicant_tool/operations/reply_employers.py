@@ -109,7 +109,7 @@ class Operation(BaseOperation):
             default=None,
         )
 
-    def run(self, tool: HHApplicantTool, args: Namespace) -> None:
+    def run(self, tool: HHApplicantTool, args: Namespace) -> None | int:
         self.tool = tool
         self.api_client = tool.api_client
         #self.resume_id = tool.first_resume_id() #вместо id первого резюме берем id из аргументов
@@ -138,6 +138,9 @@ class Operation(BaseOperation):
             else None
         )
         self.period = args.period
+
+        logger.debug(f"{self.reply_message = }")
+        return self.reply_employers()
 
     def _load_user_context(self, context_dir: Path | None) -> str:
         """Загружает пользовательский контекст из всех *.md файлов директории."""
@@ -176,9 +179,6 @@ class Operation(BaseOperation):
                 len(context),
             )
         return context
-
-        logger.debug(f"{self.reply_message = }")
-        return self.reply_employers()
 
     def reply_employers(self):
         blacklist = set(self.tool.get_blacklisted())
