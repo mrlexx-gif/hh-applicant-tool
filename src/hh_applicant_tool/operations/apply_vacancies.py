@@ -12,7 +12,7 @@ from email.message import EmailMessage
 from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator, Literal
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import requests
 
@@ -23,6 +23,7 @@ from ..api.errors import ApiError, CaptchaRequired, LimitExceeded
 from ..main import BaseNamespace, BaseOperation
 from ..storage.repositories.errors import RepositoryError
 from ..utils.datatypes import VacancyTestsData
+from ..utils.cookiejar import add_cookies
 from ..utils.find import find_key
 from ..utils.json import JSONDecoder
 from ..utils.string import (
@@ -716,49 +717,124 @@ class Operation(BaseOperation):
     SEL_CAPTCHA_IMAGE = 'img[data-qa="account-captcha-picture"]'
     SEL_CAPTCHA_INPUT = 'input[data-qa="account-captcha-input"]'
 
-    # Даже куки не грузятся, исправь
+    # Странице капчи hh.ru обязателен параметр backurl: без него прохождение
+    # капчи не завершается и повторный API-запрос снова падает с
+    # captcha_required. См. docs/hhapi/openapi.yml (ErrorsCommonCaptchaError).
+    CAPTCHA_BACKURL = "https://hh.ru/applicant/negotiations"
+    CAPTCHA_MAX_ATTEMPTS = 3
+
+    @staticmethod
+    def _playwright_cookies(cookies: Any) -> list[dict[str, Any]]:
+        """Преобразует куки из {CookieJar} в формат, понятный Playwright."""
+        playwright_cookies: list[dict[str, Any]] = []
+        for cookie in cookies:
+            if not cookie.domain or not cookie.name:
+                continue
+            expires = cookie.expires
+            playwright_cookies.append(
+                {
+                    "name": cookie.name,
+                    "value": cookie.value or "",
+                    "domain": cookie.domain,
+                    "path": cookie.path or "/",
+                    "secure": bool(cookie.secure),
+                    # В Playwright -1 означает сессионную куку
+                    "expires": int(expires) if expires and expires > 0 else -1,
+                }
+            )
+        return playwright_cookies
+
+    def _with_backurl(self, captcha_url: str) -> str:
+        """Добавляет обязательный backurl, если его ещё нет."""
+        if "backurl=" in captcha_url:
+            return captcha_url
+        sep = "&" if "?" in captcha_url else "?"
+        return f"{captcha_url}{sep}{urlencode({'backurl': self.CAPTCHA_BACKURL})}"
+
     async def _solve_captcha_async(self, captcha_url: str) -> bool:
         from playwright.async_api import async_playwright
 
         captcha_ai = self.tool.get_captcha_ai()
+        solve_url = self._with_backurl(captcha_url)
+
+        # Капчу нужно решать в том же авторизованном сеансе, что и запросы к
+        # hh.ru. Раньше браузер запускался с чистого (анонимного) контекста:
+        # решение капчи происходило в отдельной сессии, а затем её куки
+        # копировались в рабочую сессию и затирали авторизацию. Из-за этого
+        # все последующие web-запросы считались неавторизованными и
+        # появлялось ложное «Авторизация истекла требуется новая!».
+        session_cookies = self._playwright_cookies(self.tool.session.cookies)
 
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
             try:
                 context = await browser.new_context()
+                if session_cookies:
+                    await context.add_cookies(session_cookies)
+
                 page = await context.new_page()
+                await page.goto(solve_url, timeout=30000)
 
-                await page.goto(captcha_url, timeout=30000)
+                solved = False
+                for attempt in range(1, self.CAPTCHA_MAX_ATTEMPTS + 1):
+                    captcha_element = await page.wait_for_selector(
+                        self.SEL_CAPTCHA_IMAGE,
+                        timeout=10000,
+                        state="visible",
+                    )
 
-                captcha_element = await page.wait_for_selector(
-                    self.SEL_CAPTCHA_IMAGE, timeout=10000, state="visible"
-                )
+                    img_bytes = await captcha_element.screenshot()
+                    captcha_text = await asyncio.to_thread(
+                        captcha_ai.solve_captcha, img_bytes
+                    )
 
-                img_bytes = await captcha_element.screenshot()
+                    if not captcha_text:
+                        logger.error("AI не смог распознать капчу")
+                        return False
 
-                captcha_text = await asyncio.to_thread(
-                    captcha_ai.solve_captcha, img_bytes
-                )
+                    logger.info(
+                        "Капча (попытка %d/%d): %r",
+                        attempt,
+                        self.CAPTCHA_MAX_ATTEMPTS,
+                        captcha_text,
+                    )
 
-                if not captcha_text:
-                    logger.error("AI не смог распознать капчу")
+                    await page.fill(self.SEL_CAPTCHA_INPUT, captcha_text)
+                    await page.press(self.SEL_CAPTCHA_INPUT, "Enter")
+
+                    # Успешное прохождение капчи => редирект на backurl,
+                    # то есть уход со страницы /account/captcha.
+                    try:
+                        await page.wait_for_url(
+                            lambda url: "/account/captcha" not in url,
+                            timeout=15000,
+                        )
+                        solved = True
+                        break
+                    except Exception:
+                        logger.warning(
+                            "Капча не принята (попытка %d/%d), пробую снова",
+                            attempt,
+                            self.CAPTCHA_MAX_ATTEMPTS,
+                        )
+                        await page.wait_for_timeout(800)
+
+                if not solved:
+                    logger.error(
+                        "Не удалось пройти капчу за %d попыток",
+                        self.CAPTCHA_MAX_ATTEMPTS,
+                    )
                     return False
 
-                logger.info(f"Распознанный текст капчи: {captcha_text}")
-
-                await page.fill(self.SEL_CAPTCHA_INPUT, captcha_text)
-                await page.press(self.SEL_CAPTCHA_INPUT, "Enter")
-
-                await page.wait_for_load_state("networkidle", timeout=15000)
-
+                # Контекст создан из куки рабочей сессии, поэтому переносим их
+                # обратно без риска разлогиниться — так результат решения капчи
+                # попадает в ту же сессию.
                 cookies = await context.cookies()
-                for c in cookies:
-                    self.tool.session.cookies.set(
-                        c["name"],
-                        c["value"],
-                        domain=c.get("domain", ""),
-                        path=c.get("path", "/"),
-                    )
+                add_cookies(self.tool.session.cookies, cookies)
+                try:
+                    self.tool.save_cookies()
+                except Exception as ex:
+                    logger.warning(f"Не удалось сохранить cookies: {ex}")
 
                 return True
             finally:
