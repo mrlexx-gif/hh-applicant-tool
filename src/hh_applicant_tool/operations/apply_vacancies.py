@@ -92,6 +92,7 @@ class Namespace(BaseNamespace):
     context_dir: Path | None
     manual_captcha: bool
     captcha_image_path: Path | None
+    no_headless: bool
 
 
 class Operation(BaseOperation):
@@ -166,6 +167,12 @@ class Operation(BaseOperation):
             help="Если AI не смог решить капчу за несколько попыток, запросить ввод капчи у пользователя вручную.",
             action=argparse.BooleanOptionalAction,
             default=True,
+        )
+        parser.add_argument(
+            "--no-headless",
+            "-n",
+            action="store_true",
+            help="Показать окно браузера при решении капчи, чтобы ввести её вручную прямо в браузере (аналогично `login --manual`).",
         )
         parser.add_argument(
             "--captcha-image-path",
@@ -370,6 +377,7 @@ class Operation(BaseOperation):
         self.max_responses = args.max_responses
         self.manual_captcha = args.manual_captcha
         self.captcha_image_path = args.captcha_image_path
+        self.no_headless = args.no_headless
         self.metro = args.metro
         self.no_magic = args.no_magic
         self.only_with_salary = args.only_with_salary
@@ -801,12 +809,52 @@ class Operation(BaseOperation):
         except OSError as ex:
             logger.warning(f"Не удалось сохранить капчу во временный файл: {ex}")
 
-    async def _solve_captcha_manual(self, page: Any) -> bool:
-        """Запрашивает у пользователя ручной ввод капчи.
+    async def _solve_captcha_manual(
+        self, page: Any, solve_url: str, session_cookies: list[dict[str, Any]]
+    ) -> bool:
+        """Фолбэк: ручной ввод капчи после неудачи AI.
+
+        Если задан --no-headless, закрывает headless-браузер и открывает
+        видимое окно, чтобы пользователь решил капчу прямо в нём (как в
+        `login --manual`). Иначе капча выводится в терминал (kitty/sixel)
+        или сохраняется в файл, и текст вводится в консоли.
 
         Возвращает True, если капча принята (произошёл редирект со страницы
         /account/captcha), иначе False.
         """
+        # Видимое окно браузера: пользователь вводит капчу сам, ждём редирект.
+        if self.no_headless:
+            from playwright.async_api import async_playwright
+
+            print(
+                "\n[!] AI не смог решить капчу. Открываю окно браузера — "
+                "введите капчу вручную."
+            )
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(headless=False)
+                try:
+                    context = await browser.new_context()
+                    if session_cookies:
+                        await context.add_cookies(session_cookies)
+                    manual_page = await context.new_page()
+                    await manual_page.goto(solve_url, timeout=30000)
+                    try:
+                        await manual_page.wait_for_url(
+                            lambda url: "/account/captcha" not in url,
+                            timeout=300000,
+                        )
+                    except Exception:
+                        logger.error(
+                            "Капча не была введена в браузере за отведённое время."
+                        )
+                        return False
+                    # Переносим куки из видимого окна в рабочую сессию.
+                    cookies = await context.cookies()
+                    add_cookies(self.tool.session.cookies, cookies)
+                    return True
+                finally:
+                    await browser.close()
+
         try:
             captcha_element = await page.wait_for_selector(
                 self.SEL_CAPTCHA_IMAGE,
@@ -855,6 +903,9 @@ class Operation(BaseOperation):
         # появлялось ложное «Авторизация истекла требуется новая!».
         session_cookies = self._playwright_cookies(self.tool.session.cookies)
 
+        # Сначала всегда пробуем решить капчу через AI в headless-браузере.
+        # Видимое окно открывается только как фолбэк — после того, как AI
+        # исчерпал все попытки (см. ниже).
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
             try:
@@ -918,7 +969,9 @@ class Operation(BaseOperation):
                         return False
                     # Фолбэк: просим пользователя ввести капчу вручную.
                     logger.warning("Перехожу к ручному вводу капчи.")
-                    solved = await self._solve_captcha_manual(page)
+                    solved = await self._solve_captcha_manual(
+                        page, solve_url, session_cookies
+                    )
                     if not solved:
                         logger.error("Ручной ввод капчи не помог.")
                         return False
