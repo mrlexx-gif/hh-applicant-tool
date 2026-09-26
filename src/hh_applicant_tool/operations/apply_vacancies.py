@@ -26,6 +26,7 @@ from ..utils.datatypes import VacancyTestsData
 from ..utils.cookiejar import add_cookies
 from ..utils.find import find_key
 from ..utils.json import JSONDecoder
+from ..utils.terminal import print_kitty_image, print_sixel_mage
 from ..utils.string import (
     bool2str,
     rand_text,
@@ -89,6 +90,8 @@ class Namespace(BaseNamespace):
     send_email: bool
     skip_tests: bool
     context_dir: Path | None
+    manual_captcha: bool
+    captcha_image_path: Path | None
 
 
 class Operation(BaseOperation):
@@ -155,6 +158,18 @@ class Operation(BaseOperation):
         parser.add_argument(
             "--context-dir",
             help="Директория с файлами контекста пользователя (*.md). Содержимое всех *.md файлов добавляется в системный промпт AI, чтобы ответы на вопросы тестов и письма были персонализированными (профиль, навыки, зарплатные ожидания, формат работы и т.п.).",
+            type=Path,
+            default=None,
+        )
+        parser.add_argument(
+            "--manual-captcha",
+            help="Если AI не смог решить капчу за несколько попыток, запросить ввод капчи у пользователя вручную.",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+        parser.add_argument(
+            "--captcha-image-path",
+            help="Путь для сохранения картинки капчи, когда требуется ручной ввод (например, captcha.png). Если не указан, картинка выводится в терминал (kitty/sixel) или сохраняется во временный файл.",
             type=Path,
             default=None,
         )
@@ -353,6 +368,8 @@ class Operation(BaseOperation):
         self.label = args.label
         self.left_lng = args.left_lng
         self.max_responses = args.max_responses
+        self.manual_captcha = args.manual_captcha
+        self.captcha_image_path = args.captcha_image_path
         self.metro = args.metro
         self.no_magic = args.no_magic
         self.only_with_salary = args.only_with_salary
@@ -751,6 +768,79 @@ class Operation(BaseOperation):
         sep = "&" if "?" in captcha_url else "?"
         return f"{captcha_url}{sep}{urlencode({'backurl': self.CAPTCHA_BACKURL})}"
 
+    def _show_captcha_image(self, img_bytes: bytes) -> None:
+        """Показывает картинку капчи пользователю для ручного ввода.
+
+        Приоритет: явно указанный путь (--captcha-image-path) -> kitty ->
+        sixel -> временный файл. Возвращает путь к файлу, если он был создан.
+        """
+        if self.captcha_image_path:
+            try:
+                self.captcha_image_path.write_bytes(img_bytes)
+                print(f"[!] Картинка капчи сохранена: {self.captcha_image_path}")
+                return
+            except OSError as ex:
+                logger.warning(f"Не удалось сохранить капчу в файл: {ex}")
+
+        # Пытаемся вывести картинку прямо в терминал (kitty/sixel).
+        for printer in (print_kitty_image, print_sixel_mage):
+            try:
+                printer(img_bytes)
+                return
+            except Exception:
+                continue
+
+        # Фолбэк: сохраняем во временный файл, чтобы пользователь мог открыть.
+        try:
+            import tempfile
+
+            fd, path = tempfile.mkstemp(prefix="hh_captcha_", suffix=".png")
+            with open(fd, "wb") as fh:
+                fh.write(img_bytes)
+            print(f"[!] Картинка капчи сохранена: {path}")
+        except OSError as ex:
+            logger.warning(f"Не удалось сохранить капчу во временный файл: {ex}")
+
+    async def _solve_captcha_manual(self, page: Any) -> bool:
+        """Запрашивает у пользователя ручной ввод капчи.
+
+        Возвращает True, если капча принята (произошёл редирект со страницы
+        /account/captcha), иначе False.
+        """
+        try:
+            captcha_element = await page.wait_for_selector(
+                self.SEL_CAPTCHA_IMAGE,
+                timeout=10000,
+                state="visible",
+            )
+        except Exception as ex:
+            logger.error(f"Не удалось найти картинку капчи для ручного ввода: {ex}")
+            return False
+
+        img_bytes = await captcha_element.screenshot()
+        print("\n[!] AI не смог решить капчу. Требуется ручной ввод.")
+        self._show_captcha_image(img_bytes)
+
+        captcha_text = (
+            await asyncio.to_thread(input, "Введите текст с картинки: ")
+        ).strip()
+        if not captcha_text:
+            logger.error("Пустой ввод капчи, пропускаю.")
+            return False
+
+        await page.fill(self.SEL_CAPTCHA_INPUT, captcha_text)
+        await page.press(self.SEL_CAPTCHA_INPUT, "Enter")
+
+        try:
+            await page.wait_for_url(
+                lambda url: "/account/captcha" not in url,
+                timeout=15000,
+            )
+            return True
+        except Exception:
+            logger.error("Введённая вручную капча не принята.")
+            return False
+
     async def _solve_captcha_async(self, captcha_url: str) -> bool:
         from playwright.async_api import async_playwright
 
@@ -790,7 +880,7 @@ class Operation(BaseOperation):
 
                     if not captcha_text:
                         logger.error("AI не смог распознать капчу")
-                        return False
+                        break
 
                     logger.info(
                         "Капча (попытка %d/%d): %r",
@@ -824,7 +914,14 @@ class Operation(BaseOperation):
                         "Не удалось пройти капчу за %d попыток",
                         self.CAPTCHA_MAX_ATTEMPTS,
                     )
-                    return False
+                    if not self.manual_captcha:
+                        return False
+                    # Фолбэк: просим пользователя ввести капчу вручную.
+                    logger.warning("Перехожу к ручному вводу капчи.")
+                    solved = await self._solve_captcha_manual(page)
+                    if not solved:
+                        logger.error("Ручной ввод капчи не помог.")
+                        return False
 
                 # Контекст создан из куки рабочей сессии, поэтому переносим их
                 # обратно без риска разлогиниться — так результат решения капчи
