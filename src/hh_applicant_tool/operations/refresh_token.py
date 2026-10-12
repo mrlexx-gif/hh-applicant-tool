@@ -4,13 +4,13 @@ import argparse
 import logging
 from typing import TYPE_CHECKING
 
-from ..main import BaseNamespace, BaseOperation
+from ..tool import BaseNamespace, BaseOperation
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
+    from ..tool import HHApplicantTool
 
 
-logger = logging.getLogger(__package__)
+logger = logging.getLogger("hh-applicant-tool")
 
 
 class Namespace(BaseNamespace):
@@ -18,7 +18,7 @@ class Namespace(BaseNamespace):
 
 
 class Operation(BaseOperation):
-    """Обновляет access_token и refresh_token в случае необходимости."""
+    """Обновляет access_token и refresh_token в случае необходимости. Вызов этой команды как правило не требуется, так как токен обновляется автоматически при запросе к API."""
 
     __aliases__ = ["refresh"]
 

@@ -7,15 +7,15 @@ import sqlite3
 import sys
 from typing import TYPE_CHECKING
 
-from ..main import BaseNamespace, BaseOperation
+from ..tool import BaseNamespace, BaseOperation
 from ..storage import apply_migration, list_migrations
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
+    from ..tool import HHApplicantTool
 
 SUCKASS = "✅ Success!"
 
-logger = logging.getLogger(__package__)
+logger = logging.getLogger("hh-applicant-tool")
 
 
 class Namespace(BaseNamespace):

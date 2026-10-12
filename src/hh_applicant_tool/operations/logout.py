@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING
 
 from hh_applicant_tool.api.errors import ApiError
 
-from ..main import BaseNamespace, BaseOperation
+from ..tool import BaseNamespace, BaseOperation
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
+    from ..tool import HHApplicantTool
 
 
-logger = logging.getLogger(__package__)
+logger = logging.getLogger("hh-applicant-tool")
 
 
 class Namespace(BaseNamespace):
@@ -31,5 +31,5 @@ class Operation(BaseOperation):
     def run(self, tool: HHApplicantTool, args: BaseNamespace) -> None:
         try:
             tool.api_client.delete("/oauth/token")
-        except ApiError as ex:
-            logger.error(f"Ошибка при выходе из профиля: {ex}")
+        finally:
+            tool.session.cookies.clear()

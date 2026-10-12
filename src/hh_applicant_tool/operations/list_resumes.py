@@ -4,18 +4,16 @@ import argparse
 import logging
 from typing import TYPE_CHECKING
 
-from prettytable import PrettyTable
-
 from ..api.datatypes import PaginatedItems
-from ..main import BaseNamespace, BaseOperation
-from ..utils.string import shorten
+from ..tool import BaseNamespace, BaseOperation
+from ..utils.table import print_table
 
 if TYPE_CHECKING:
     from ..api import datatypes
-    from ..main import HHApplicantTool
+    from ..tool import HHApplicantTool
 
 
-logger = logging.getLogger(__package__)
+logger = logging.getLogger("hh-applicant-tool")
 
 
 class Namespace(BaseNamespace):
@@ -35,17 +33,14 @@ class Operation(BaseOperation):
         logger.debug(resumes)
         tool.storage.resumes.save_batch(resumes)
 
-        t = PrettyTable(
-            field_names=["ID", "Название", "Статус"], align="l", valign="t"
-        )
-        t.add_rows(
-            [
+        print_table(
+            headers=["ID", "Название", "Статус"],
+            rows=[
                 (
                     x["id"],
-                    shorten(x["title"]),
+                    x["title"],
                     x["status"]["name"].title(),
                 )
                 for x in resumes
-            ]
+            ],
         )
-        print(t)

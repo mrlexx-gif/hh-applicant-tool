@@ -1,4 +1,4 @@
-# TODO: дописать. Этот код сгенерирован Chat GPT. Я половину его бреда
+# К удалению
 # переписал, осталось "чуть-чуть"
 # За основу взять этот код
 # https://github.com/s3rgeym/hh-ai-responder/blob/main/main.go
@@ -10,18 +10,18 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import cached_property
-from threading import Event
 from typing import TYPE_CHECKING, Any
 
 from hh_applicant_tool.api.errors import ApiError
 
-from ..main import BaseNamespace, BaseOperation
+from ..errors import OperationCanceled
+from ..tool import BaseNamespace, BaseOperation
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
+    from ..tool import HHApplicantTool
 
 
-logger = logging.getLogger(__package__)
+logger = logging.getLogger("hh-applicant-tool")
 
 
 @dataclass
@@ -54,7 +54,7 @@ class Namespace(BaseNamespace):
 
 
 class Operation(BaseOperation):
-    """Автоматические ответы на сообщения работодателей"""
+    """Автоответчик для чата с решением тестов"""
 
     __aliases__: list[str] = ["chat-autoreply"]
 
@@ -83,19 +83,19 @@ class Operation(BaseOperation):
 
     def run(self, tool: HHApplicantTool, args: Namespace) -> None:
         self.tool = tool
-        cancel_event = getattr(args, "_cancel_event", Event())
+
+        self.ai_client = self.tool.get_ai_client()
+
+        # Этот костыль убрать везде надо
         logger.info("Автоответчик запущен")
 
-        while not cancel_event.is_set():
+        while True:
             try:
                 chats = self.get_chats_awaiting_reply(
                     args.max_pages,
                 )
 
                 for chat in chats:
-                    if cancel_event.is_set():
-                        break
-
                     if chat.is_discard:
                         if args.delete:
                             try:
@@ -122,19 +122,18 @@ class Operation(BaseOperation):
                             ex,
                         )
 
+            except KeyboardInterrupt as ex:
+                logger.info("Автоответчик остановлен")
+                raise OperationCanceled() from ex
             except ApiError as ex:
                 logger.error("Ошибка получения чатов: %s", ex)
             except Exception:
                 logger.exception("Ошибка автоответчика")
 
-            cancel_event.wait(args.interval)
-
-        logger.info("Автоответчик остановлен")
-
     @cached_property
     def chat_url(self) -> str:
-        rc = self.tool.get_redirect_config("https://hh.ru/applicant/my_resumes")
-        return rc["config"]["externalMicroFrontendHosts"]["chatik"]
+        r = self.tool.get_initial_state("https://hh.ru/applicant/my_resumes")
+        return r["config"]["externalMicroFrontendHosts"]["chatik"]
 
     def get_chats(
         self,
@@ -286,7 +285,13 @@ class Operation(BaseOperation):
                         resume_experience=resume_experience,
                         salary=salary,
                         skills=skills,
+                        resources=data.get("resources") or {},
                     )
+
+                    # parse_chat_item отбрасывает чаты без сообщения,
+                    # без вакансии или старше 72 часов
+                    if chat is None:
+                        continue
 
                     if chat.is_discard:
                         result.append(chat)
@@ -299,6 +304,69 @@ class Operation(BaseOperation):
 
         return result
 
+    def get_last_message(
+        self,
+        item: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Последнее сообщение чата.
+
+        В списке чатов hh кладёт его и как lastMessage, и (не всегда)
+        как messages.items. Берём что нашлось: без сообщения отвечать
+        не на что, и такой чат тихо теряется.
+        """
+        message_items = (item.get("messages") or {}).get("items") or []
+
+        if message_items:
+            return message_items[-1]
+
+        last_message = item.get("lastMessage") or item.get("last_message")
+
+        return last_message if isinstance(last_message, dict) else None
+
+    def get_resource(
+        self,
+        resources: dict[str, Any] | list[Any] | None,
+        ids: Any = None,
+        resource_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Достаёт вакансию или резюме из resources чата.
+
+        Формат у hh меняется от ответа к ответу: это может быть карта
+        {id: {...}}, список объектов, а может быть только список id в
+        item["resources"]["VACANCY"], когда сами объекты лежат в
+        resources верхнего уровня. Поэтому ищем по ключу, а если ключа
+        нет — берём единственный объект.
+        """
+        if not resources:
+            return None
+
+        if isinstance(resources, list):
+            first = resources[0]
+            return first if isinstance(first, dict) else None
+
+        keys = []
+
+        if resource_id is not None:
+            keys.append(resource_id)
+
+        if isinstance(ids, (list, tuple)):
+            keys.extend(ids)
+        elif ids is not None:
+            keys.append(ids)
+
+        for key in keys:
+            # Ключи в JSON всегда строки, но в тестах и в коде id
+            # остаётся числом — проверяем оба варианта
+            for variant in (str(key), key):
+                value = resources.get(variant)
+
+                if isinstance(value, dict):
+                    return value
+
+        first = next(iter(resources.values()), None)
+
+        return first if isinstance(first, dict) else None
+
     def parse_chat_item(
         self,
         item: dict[str, Any],
@@ -309,15 +377,17 @@ class Operation(BaseOperation):
         resume_experience: str,
         salary: str,
         skills: str,
+        resources: dict[str, Any] | None = None,
     ) -> ChatToReply | None:
-        chat_id = item.get("id")
-        messages = item.get("messages", {})
-        message_items = messages.get("items", [])
+        chat_id = item.get("id") or item.get("chatId")
 
-        if not message_items:
+        if chat_id is None:
             return None
 
-        last_message = message_items[-1]
+        last_message = self.get_last_message(item)
+
+        if not last_message:
+            return None
 
         created_at = self.parse_datetime(
             last_message.get("createdAt")
@@ -347,14 +417,40 @@ class Operation(BaseOperation):
 
         is_discard = workflow_transition.get("applicantState") == "DISCARD"
 
-        resources = item.get("resources") or {}
+        item_resources = item.get("resources") or {}
+        # Объекты вакансии и резюме hh отдаёт двумя способами: либо
+        # картой прямо в resources элемента чата, либо списком id
+        # вида {"VACANCY": ["123"]}, а сами объекты кладутся в
+        # resources верхнего уровня ответа. Поэтому ищем в обоих
+        # местах, иначе чат молча теряется.
+        common_resources = resources or {}
 
-        vacancies = resources.get("vacancies") or {}
-        resumes = resources.get("resumes") or {}
+        vacancies = (
+            item_resources.get("vacancies")
+            or common_resources.get("vacancies")
+            or {}
+        )
+        resumes = (
+            item_resources.get("resumes")
+            or common_resources.get("resumes")
+            or {}
+        )
 
-        vacancy_id = vacancy.get("vacancyId") or vacancy.get("id")
+        vacancy = self.get_resource(
+            vacancies,
+            item_resources.get("VACANCY"),
+        )
+        resume = self.get_resource(
+            resumes,
+            item_resources.get("RESUME"),
+            resource_id=resume_id,
+        )
 
-        if vacancy_id is None:
+        if vacancy is None or resume is None:
+            logger.debug(
+                "Чат %s пропущен: hh не отдал вакансию или резюме",
+                chat_id,
+            )
             return None
 
         company = vacancy.get("company") or {}
@@ -429,13 +525,11 @@ class Operation(BaseOperation):
             messages,
         )
 
-        temperature = 0.1 if chat.reply_options else 0.5
-
-        ai_client = self.tool.get_chat_ai(system_prompt)
-        ai_client.temperature = temperature
-        ai_client.max_completion_tokens = 512
-
-        reply = ai_client.complete(user_prompt).strip()
+        reply = self.ai_client.complete(
+            message=user_prompt,
+            system_prompt=system_prompt,
+            temperature=0.1 if chat.reply_options else 0.5,
+        ).strip()
 
         if not reply:
             logger.warning(

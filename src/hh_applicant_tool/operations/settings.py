@@ -5,19 +5,19 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
-from prettytable import PrettyTable
-
 from .. import utils
-from ..main import BaseNamespace, BaseOperation
+from ..tool import BaseNamespace, BaseOperation
+from ..utils.table import print_table
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
+    from ..tool import HHApplicantTool
 
 
 MISSING = type("Missing", (), {"__str__": lambda self: "Не установлено"})()
+MAX_VALUE_WIDTH = 80
 
 
-logger = logging.getLogger(__package__)
+logger = logging.getLogger("hh-applicant-tool")
 
 
 class Namespace(BaseNamespace):
@@ -43,7 +43,7 @@ class Operation(BaseOperation):
             "-d",
             "--delete",
             action="store_true",
-            help="Удалить настройку по ключу либо удалить все насйтроки, если ключ не передан",
+            help="Удалить настройку по ключу либо удалить все настройки, если ключ не передан",
         )
         parser.add_argument(
             "key", nargs="?", help="Ключ настройки", default=MISSING
@@ -73,22 +73,20 @@ class Operation(BaseOperation):
             # Get value
             value = settings.get_value(args.key, MISSING)
             if value is not MISSING:
-                # print(type(value).__name__, value)
                 print(value)
             else:
                 print(f"⚠️ Настройка '{args.key}' не найдена")
         else:
             # List all settings
-            settings = settings.find()
-            t = PrettyTable(field_names=["Ключ", "Тип", "Значение"], align="l")
-            for setting in settings:
-                if setting.key.startswith("_"):
-                    continue
-                t.add_row(
-                    [
-                        setting.key,
-                        type(setting.value).__name__,
-                        setting.value,
-                    ]
-                )
-            print(t)
+            print_table(
+                headers=["Ключ", "Тип", "Значение"],
+                rows=[
+                    (
+                        s.key,
+                        type(s.value).__name__,
+                        "None" if s.value is None else s.value,
+                    )
+                    for s in settings.find()
+                    if not s.key.startswith("_")
+                ],
+            )

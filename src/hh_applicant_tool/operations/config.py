@@ -8,13 +8,13 @@ import platform
 import subprocess
 from typing import TYPE_CHECKING, Any
 
-from ..main import BaseNamespace, BaseOperation
+from ..tool import BaseNamespace, BaseOperation
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
+    from ..tool import HHApplicantTool
 
 
-logger = logging.getLogger(__package__)
+logger = logging.getLogger("hh-applicant-tool")
 
 
 class Namespace(BaseNamespace):
@@ -27,9 +27,9 @@ class Namespace(BaseNamespace):
 
 def get_value(data: dict[str, Any], path: str) -> Any:
     for key in path.split("."):
-        if isinstance(data, dict):
+        try:
             data = data.get(key)
-        else:
+        except AttributeError:
             return None
     return data
 

@@ -1,19 +1,15 @@
 from __future__ import annotations
 
 import dataclasses
-import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from threading import Lock
-from typing import Any, Literal, TypeVar
+from typing import Any, Callable, Literal, TypeVar
 from urllib.parse import urlencode, urljoin
 
 import requests
-from requests import Session
-
-from hh_applicant_tool.api.user_agent import generate_android_useragent
 
 from . import errors
 from .client_keys import (
@@ -21,18 +17,30 @@ from .client_keys import (
     ANDROID_CLIENT_SECRET,
 )
 from .datatypes import AccessToken
+from .user_agent import generate_android_useragent
 
 __all__ = ("ApiClient", "OAuthClient")
 
 HH_API_URL = "https://api.hh.ru/"
 HH_OAUTH_URL = "https://hh.ru/oauth/"
 DEFAULT_DELAY = 0.345
+DEFAULT_CAPTCHA_COOLDOWN = 3.0
+MAX_RETRIES = 3
 
-AllowedMethods = Literal["GET", "POST", "PUT", "DELETE"]
+AllowedMethods = Literal[
+    "GET",
+    "POST",
+    "PUT",
+    "DELETE",
+    "get",
+    "post",
+    "put",
+    "delete",
+]
+
 T = TypeVar("T")
 
-
-logger = logging.getLogger(__package__)
+logger = logging.getLogger("hh-applicant-tool")
 
 
 # Thread-safe
@@ -40,23 +48,31 @@ logger = logging.getLogger(__package__)
 class BaseClient:
     base_url: str
     _: dataclasses.KW_ONLY
-    user_agent: str | None = None
-    session: Session | None = None
     delay: float | None = None
-    _previous_request_time: float = 0.0
+    captcha_handler: Callable[[str], bool] | None = None
+    captcha_cooldown: float | None = None
+    max_retries: int | None = None
+    session: requests.Session | None = None
+    user_agent: str | None = None
+
+    _previous_request_time: float = field(default=0.0, init=False)
+    _lock: Lock = field(default_factory=Lock, init=False)
+    _captcha_lock: Lock = field(default_factory=Lock, init=False)
 
     def __post_init__(self) -> None:
         assert self.base_url.endswith("/"), "base_url must ends with /"
+        self.captcha_cooldown = (
+            self.captcha_cooldown or DEFAULT_CAPTCHA_COOLDOWN
+        )
         self.delay = self.delay or DEFAULT_DELAY
+        self.max_retries = self.max_retries or MAX_RETRIES
         self.user_agent = self.user_agent or generate_android_useragent()
-
-        # logger.debug(f"user agent: {self.user_agent}")
+        class_name = self.__class__.__name__
+        logger.debug(f"{class_name} User-Agent: {self.user_agent}")
 
         if not self.session:
-            logger.debug("create new session")
+            logger.debug(f"Сreate new session for {class_name}")
             self.session = requests.session()
-
-        self.lock = Lock()
 
     @property
     def proxies(self):
@@ -64,46 +80,81 @@ class BaseClient:
 
     def _default_headers(self) -> dict[str, str]:
         return {
+            "Accept": "application/json",
             "User-Agent": self.user_agent,
             "X-HH-App-Active": "true",
         }
+
+    def _wait_for_delay(self, delay: float | None = None) -> None:
+        """Выдерживает паузу между запросами.
+
+        На серваке какая-то анти-DDOS система, поэтому между запросами
+        должно пройти не меньше `delay` секунд (по умолчанию self.delay).
+        Вызывать нужно под self.lock, т.к. читается _previous_request_time.
+        """
+        wait = (
+            (self.delay if delay is None else delay)
+            - time.monotonic()
+            + self._previous_request_time
+        )
+        if wait > 0:
+            logger.debug("wait %fs before request", wait)
+            time.sleep(wait)
 
     def request(
         self,
         method: AllowedMethods,
         endpoint: str,
         params: dict[str, Any] | None = None,
+        *,
         delay: float | None = None,
         as_json: bool = False,
         **kwargs: Any,
     ) -> T:
-        # Не знаю насколько это "правильно"
-        assert method in AllowedMethods.__args__
+        method = method.upper()
         params = dict(params or {})
         params.update(kwargs)
         url = self.resolve_url(endpoint)
-        with self.lock:
-            # На серваке какая-то анти-DDOS система
-            if (
-                delay := (self.delay if delay is None else delay)
-                - time.monotonic()
-                + self._previous_request_time
-            ) > 0:
-                logger.debug("wait %fs before request", delay)
-                time.sleep(delay)
-            has_body = method in ["POST", "PUT"]
-            payload = {
-                ["data", "json"][as_json] if has_body else "params": params
-            }
-            # logger.debug(f"request info: {method = }, {url = }, {headers = }, params = {repr(params)[:255]}")
-            response = self.session.request(
-                method,
-                url,
-                **payload,
-                headers=self._default_headers(),
-                allow_redirects=False,
-            )
-            try:
+
+        if method in ("POST", "PUT"):
+            payload = {"json" if as_json else "data": params}
+        else:
+            payload = {"params": params}
+
+        last_exc: Exception | None = None
+
+        for attempt in range(1, self.max_retries + 1):
+            with self._lock:
+                self._wait_for_delay(delay)
+                logger.debug(
+                    f"({attempt}/{self.max_retries}) {method} {url} {params!r}",
+                )
+                try:
+                    # Заголовки собираются на каждой попытке, чтобы
+                    # подхватывать обновлённый access token.
+                    response = self.session.request(
+                        method,
+                        url,
+                        headers=self._default_headers(),
+                        allow_redirects=False,
+                        **payload,
+                    )
+                except requests.ConnectionError as ex:
+                    logger.warning(
+                        "(%d/%d) connection error: %s %s: %s",
+                        attempt,
+                        self.max_retries,
+                        method,
+                        url,
+                        ex,
+                    )
+                    last_exc = ex
+                    continue
+                finally:
+                    self._previous_request_time = time.monotonic()
+
+                logger.debug("%s %s %d", method, url, response.status_code)
+
                 # У этих лошков сервер не отдает Content-Length, а кривое API
                 # отдает пустые ответы, например, при отклике на вакансии,
                 # и мы не можем узнать содержит ли ответ тело
@@ -112,24 +163,19 @@ class BaseClient:
                 # 'Transfer-Encoding': 'chunked'
                 try:
                     rv = response.json() if response.text else {}
-                except json.JSONDecodeError as ex:
+                except ValueError as ex:  # включая JSONDecodeError
                     raise errors.BadResponse(
-                        f"Can't decode JSON: {method} {url} ({response.status_code})"
+                        f"Can't decode JSON: {method} {url} "
+                        f"({response.status_code})"
                     ) from ex
-            finally:
-                logger.debug(
-                    "%d %s %s with params: %.1000s",
-                    response.status_code,
-                    method,
-                    url,
-                    params or "-",
-                )
-                self._previous_request_time = time.monotonic()
-        errors.ApiError.raise_for_status(response, rv)
-        assert 300 > response.status_code >= 200, (
-            f"Unexpected status code for {method} {url}: {response.status_code}"
-        )
-        return rv
+
+            # CaptchaRequired и прочие ошибки пробрасываются наверх
+            errors.ApiError.raise_for_status(response, rv)
+            return rv
+
+        # Все попытки закончились ошибками соединения
+        assert last_exc is not None
+        raise last_exc
 
     def get(self, *args, **kwargs) -> T:
         return self.request("GET", *args, **kwargs)
@@ -162,17 +208,17 @@ class OAuthClient(BaseClient):
         self.client_id = self.client_id or ANDROID_CLIENT_ID
         self.client_secret = self.client_secret or ANDROID_CLIENT_SECRET
 
-    @property
-    def authorize_url(self) -> str:
+    def authorize_url(self, **kwargs: Any) -> str:
         params = dict(
             client_id=self.client_id,
             redirect_uri=self.redirect_uri,
             response_type="code",
             scope=self.scope,
             state=self.state,
+            **kwargs,
         )
-        params_qs = urlencode({k: v for k, v in params.items() if v})
-        return self.resolve_url(f"/authorize?{params_qs}")
+        query = urlencode({k: v for k, v in params.items() if v})
+        return self.resolve_url(f"/authorize?{query}")
 
     def request_access_token(
         self, endpoint: str, params: dict[str, Any] | None = None, **kw: Any
@@ -225,6 +271,8 @@ class ApiClient(BaseClient):
             client_secret=self.client_secret,
             user_agent=self.user_agent,
             session=self.session,
+            captcha_handler=self.captcha_handler,
+            captcha_cooldown=self.captcha_cooldown,
         )
 
     def _default_headers(
@@ -235,39 +283,46 @@ class ApiClient(BaseClient):
             return headers
         # Это очень интересно, что access token'ы начинаются с USER, т.е. API может содержать какую-то уязвимость, связанную с этим
         assert self.access_token.startswith("USER")
-        return headers | {"authorization": f"Bearer {self.access_token}"}
+        return headers | {"Authorization": f"Bearer {self.access_token}"}
 
     # Реализовано автоматическое обновление токена
     def request(
         self,
-        method: AllowedMethods,
+        method: str,
         endpoint: str,
         params: dict[str, Any] | None = None,
         delay: float | None = None,
         as_json: bool = False,
         **kwargs: Any,
     ) -> T:
-        def do_request():
-            return BaseClient.request(
-                self, method, endpoint, params, delay, as_json, **kwargs
+        def send_request():
+            return super(ApiClient, self).request(
+                method,
+                endpoint,
+                params,
+                delay=delay,
+                as_json=as_json,
+                **kwargs,
             )
 
         try:
-            return do_request()
+            return send_request()
         # TODO: добавить класс для ошибок типа AccessTokenExpired
         except errors.Forbidden as ex:
+            # тут при получении 403 происходит обновление access token, если
+            # задан и не протух refresh
             if not self.is_access_expired or not self.refresh_token:
                 raise ex
             logger.info("try to refresh access_token")
             # Пробуем обновить токен
             self.refresh_access_token()
             # И повторно отправляем запрос
-            return do_request()
+            return send_request()
 
     def handle_access_token(self, token: AccessToken) -> None:
-        for field in ("access_token", "refresh_token", "access_expires_at"):
-            if field in token and hasattr(self, field):
-                setattr(self, field, token[field])
+        for name in ("access_token", "refresh_token", "access_expires_at"):
+            if name in token and hasattr(self, name):
+                setattr(self, name, token[name])
 
     def refresh_access_token(self) -> None:
         if not self.refresh_token:
