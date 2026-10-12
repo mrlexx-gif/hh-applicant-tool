@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING
 
 from ..ai.base import AIError
 from ..api import ApiError, datatypes
-from ..main import BaseNamespace, BaseOperation
+from ..tool import BaseNamespace, BaseOperation
 from ..utils.date import parse_api_datetime
 from ..utils.string import rand_text
 
 if TYPE_CHECKING:
-    from ..main import HHApplicantTool
+    from ..tool import HHApplicantTool
 
 
 try:
@@ -27,7 +27,15 @@ except ImportError:
     pass
 
 
-logger = logging.getLogger(__package__)
+DEFAULT_SYSTEM_PROMPT = (
+    "Ты — соискатель на HeadHunter. Отвечай вежливо и кратко."
+)
+DEFAULT_USER_PROMPT = (
+    "Напиши короткий ответ работодателю на основе истории переписки."
+)
+
+
+logger = logging.getLogger("hh-applicant-tool")
 
 
 class Namespace(BaseNamespace):
@@ -35,7 +43,6 @@ class Namespace(BaseNamespace):
     max_pages: int
     only_invitations: bool
     dry_run: bool
-    use_ai: bool
     system_prompt: str
     message_prompt: str
     period: int
@@ -85,22 +92,14 @@ class Operation(BaseOperation):
             action=argparse.BooleanOptionalAction,
         )
         parser.add_argument(
-            "--use-ai",
-            "--ai",
-            help="Использовать AI для автоматической генерации ответов",
-            action=argparse.BooleanOptionalAction,
-        )
-        parser.add_argument(
             "--system-prompt",
             "--ai-system",
             help="Системный промпт для AI",
-            default="Ты — соискатель на HeadHunter. Отвечай вежливо и кратко.",
         )
         parser.add_argument(
             "--message-prompt",
             "--prompt",
             help="Промпт для генерации сообщения",
-            default="Напиши короткий ответ работодателю на основе истории переписки.",
         )
         parser.add_argument(
             "--context-dir",
@@ -112,7 +111,7 @@ class Operation(BaseOperation):
     def run(self, tool: HHApplicantTool, args: Namespace) -> None | int:
         self.tool = tool
         self.api_client = tool.api_client
-        #self.resume_id = tool.first_resume_id() #вместо id первого резюме берем id из аргументов
+        # self.resume_id = tool.first_resume_id() #вместо id первого резюме берем id из аргументов
         self.resume_id = args.resume_id
         self.reply_message = args.reply_message or tool.config.get(
             "reply_message"
@@ -139,6 +138,16 @@ class Operation(BaseOperation):
         )
         self.period = args.period
 
+        self.reply_chat_ai = None
+        if args.use_ai:
+            c = tool.get_openai_config("openai.reply_chat")
+            c.setdefault("system_prompt", DEFAULT_SYSTEM_PROMPT)
+            if args.system_prompt:
+                c["system_prompt"] = args.system_prompt
+
+            self.reply_chat_ai = tool.get_ai_client(**c)
+
+        self.period = args.period
         logger.debug(f"{self.reply_message = }")
         return self.reply_employers()
 
@@ -186,7 +195,7 @@ class Operation(BaseOperation):
         resumes = self.tool.get_resumes()
         resumes = (
             list(filter(lambda x: x["id"] == self.resume_id, resumes))
-            if self.resume_id is not None # добавляем проверку на пустоту
+            if self.resume_id is not None  # добавляем проверку на пустоту
             else resumes
         )
         resumes = list(
@@ -321,7 +330,7 @@ class Operation(BaseOperation):
                             rand_text(self.reply_message) % placeholders
                         )
                         logger.debug(f"Template message: {send_message}")
-                    elif self.cover_letter_ai:
+                    elif self.reply_chat_ai:
                         try:
                             ai_query = (
                                 f"Вакансия: {placeholders['vacancy_name']}\n"
@@ -329,9 +338,7 @@ class Operation(BaseOperation):
                                 + "\n".join(message_history[-10:])
                                 + f"\n\nИнструкция: {self.message_prompt}"
                             )
-                            send_message = self.cover_letter_ai.complete(
-                                ai_query
-                            )
+                            send_message = self.reply_chat_ai.complete(ai_query)
                             logger.debug(f"AI message: {send_message}")
                         except AIError as ex:
                             logger.warning(
