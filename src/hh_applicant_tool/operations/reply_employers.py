@@ -124,26 +124,21 @@ class Operation(BaseOperation):
         # Загружаем пользовательский контекст (*.md) и добавляем его в системный
         # промпт AI для персонализации ответов
         self._user_context = self._load_user_context(args.context_dir)
-        system_prompt = args.system_prompt
+        system_prompt = args.system_prompt or ""
         if self._user_context:
             system_prompt += (
                 "\n\nИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ "
                 "(обязательно используй эти данные для персонализации "
                 "своих ответов):\n" + self._user_context
             )
-        self.cover_letter_ai = (
-            tool.get_cover_letter_ai(system_prompt)
-            if args.use_ai
-            else None
-        )
         self.period = args.period
 
         self.reply_chat_ai = None
         if args.use_ai:
             c = tool.get_openai_config("openai.reply_chat")
             c.setdefault("system_prompt", DEFAULT_SYSTEM_PROMPT)
-            if args.system_prompt:
-                c["system_prompt"] = args.system_prompt
+            if system_prompt:
+                c["system_prompt"] = system_prompt
 
             self.reply_chat_ai = tool.get_ai_client(**c)
 

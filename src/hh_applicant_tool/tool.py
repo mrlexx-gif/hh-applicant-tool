@@ -362,6 +362,13 @@ class HHApplicantTool(BaseAttrs):
                 parents.append(current)
 
         if not parents:
+            # Обратная совместимость со старым «плоским» форматом конфига,
+            # где секции задавались одним ключом через подчёркивание:
+            # "openai.cover_letter" -> "openai_cover_letter".
+            flat_key = "_".join(keys)
+            flat = self.config.get(flat_key)
+            if isinstance(flat, dict):
+                return deepcopy(flat)
             return {}
 
         result = deepcopy(parents[-1])
@@ -589,9 +596,26 @@ class HHApplicantTool(BaseAttrs):
         return server
 
     def _solve_captcha(self, image_data: bytes) -> str:
+        # ВАЛИДАЦИЯ captcha: если эта строка есть в логе, картинку реально
+        # пытались распознать.
+        logger.debug(
+            "ВАЛИДАЦИЯ captcha: _solve_captcha вызван (use_ai=%s, kitty=%s, "
+            "sixel=%s, %d байт)",
+            self.use_ai,
+            self.use_kitty,
+            self.use_sixel,
+            len(image_data),
+        )
         if self.use_ai:
-            return self.captcha_ai.recognize_text(image_data)
+            # Алфавит ответа задаёт язык картинки: иначе кириллический
+            # ответ уезжает туда, где hh.ru ждёт латиницу.
+            script = ai.captcha_script(self.captcha_lang)
+            return self.captcha_ai.read_captcha(image_data, script=script)
 
+        return self._solve_captcha_manual(image_data)
+
+    def _solve_captcha_manual(self, image_data: bytes) -> str:
+        """Ручное решение капчи: kitty/sixel в терминале либо окно Tk."""
         if self.use_kitty or self.use_sixel:
             if self.use_kitty:
                 print_kitty_image(image_data)
@@ -611,6 +635,13 @@ class HHApplicantTool(BaseAttrs):
     ) -> CaptchaSolution:
         """Если API сайта возвращает ответ с hhcaptcha.captchaState, то
         появляется всплывающее окно для ввода капчи"""
+        # ВАЛИДАЦИЯ captcha: маркер входа в решение капчи.
+        logger.debug(
+            "ВАЛИДАЦИЯ captcha: solve_captcha вызван (state=%.24s, "
+            "referer=%s)",
+            captcha_state,
+            referer_url,
+        )
         captcha_img = self.get_captcha_image(
             lang=lang,
             referer_url=referer_url,
@@ -633,7 +664,9 @@ class HHApplicantTool(BaseAttrs):
         xsrf_token: str | None = None,
     ) -> CaptchaSolution:
         """Отдельная страница с капчей"""
-        logger.debug("captcha url: %s", captcha_url)
+        logger.debug(
+            "ВАЛИДАЦИЯ captcha: solve_captcha_url вызван: %s", captcha_url
+        )
 
         # Посещаем страницу с капчей
         r = self.session.get(
@@ -665,6 +698,10 @@ class HHApplicantTool(BaseAttrs):
         lang = lang or self.captcha_lang
         target_url = urljoin(
             referer_url or HH_BASE_URL, "/captcha?lang=" + quote(lang)
+        )
+        logger.debug(
+            "ВАЛИДАЦИЯ captcha: get_captcha_image запрашивает %s",
+            target_url,
         )
         logger.debug(
             "Отправляем POST-запрос на %s для получения captcha key",

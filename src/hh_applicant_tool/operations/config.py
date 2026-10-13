@@ -136,11 +136,25 @@ class Operation(BaseOperation):
             return
 
         if args.edit:
+            self._ensure_config_file(config)
             self._open_editor(config_path)
             return
 
         # Default action: show content
         print(json.dumps(config, indent=2, ensure_ascii=False))
+
+    @staticmethod
+    def _ensure_config_file(config) -> None:
+        """Создаёт config.toml, если его ещё нет (мигрируя config.json).
+
+        Без этого `config -e` падает на os.startfile с WinError 2, когда
+        настройки лежат в устаревшем config.json.
+        """
+        path = config._config_path
+        if path.exists():
+            return
+        config.save()
+        logger.info("Создан файл конфигурации: %s", path)
 
     def _open_editor(self, filepath: str) -> None:
         """Открывает файл в редакторе по умолчанию в зависимости от ОС."""

@@ -2,7 +2,9 @@
 # API HH и ваши проблемы с капчей. Прекратите добавлять методы, которые выходят
 # за его зону ответственности.
 import base64
+import json
 import logging
+import re
 import time
 from dataclasses import KW_ONLY, dataclass, field
 from email.utils import parsedate_to_datetime
@@ -23,6 +25,85 @@ logger = logging.getLogger("hh-applicant-tool")
 
 class OpenAIError(AIError):
     pass
+
+
+# Ожидаемый алфавит ответа капчи. Язык картинки однозначно задаёт
+# алфавит: кириллица и латиница не взаимозаменяемы.
+CAPTCHA_SCRIPT_LATIN = "latin"
+CAPTCHA_SCRIPT_CYRILLIC = "cyrillic"
+CAPTCHA_SCRIPT_ANY = "any"
+
+# Общая часть промпта: что в картинке и в каком формате вернуть ответ.
+# Алфавит сюда не зашит — иначе латинская картинка провоцирует модель на
+# кириллический ответ.
+_CAPTCHA_PROMPT_COMMON = (
+    "Read the CAPTCHA image. It contains exactly two short words written "
+    "along an arc. Return the two words exactly as they are written: do "
+    "NOT guess, do NOT repair them, and do NOT add, remove or reorder "
+    "letters. Answer with strict JSON only, without any explanations: "
+    '{"first_word": "<word>", "second_word": "<word>"}.'
+)
+
+# Правила для конкретного алфавита.
+_CAPTCHA_PROMPT_RULES = {
+    CAPTCHA_SCRIPT_LATIN: (
+        " The letters are LATIN (a-z). Copy them exactly as Latin letters; "
+        "never turn them into Cyrillic."
+    ),
+    CAPTCHA_SCRIPT_CYRILLIC: (
+        " The letters are Cyrillic (а-я, А-Я). Copy them exactly as "
+        "Cyrillic letters; never transliterate them into Latin. "
+        "Copy ё as ё."
+    ),
+    CAPTCHA_SCRIPT_ANY: (
+        " The letters may be Latin or Cyrillic; copy them exactly as they "
+        "appear."
+    ),
+}
+
+_CAPTCHA_USER_PROMPT = {
+    CAPTCHA_SCRIPT_LATIN: (
+        "Read the two Latin words in the image and return JSON with "
+        '"first_word" and "second_word".'
+    ),
+    CAPTCHA_SCRIPT_CYRILLIC: (
+        "Read the two Cyrillic words in the image and return JSON with "
+        '"first_word" and "second_word".'
+    ),
+    CAPTCHA_SCRIPT_ANY: (
+        "Read the two words in the image and return JSON with "
+        '"first_word" and "second_word".'
+    ),
+}
+
+
+def captcha_script(language: str | None) -> str:
+    """Ожидаемый алфавит ответа для языка картинки.
+
+    Неизвестный язык считаем английским: дефолт
+    ``CAPTCHA_LANGUAGE_DEFAULT`` тоже ``en``.
+    """
+    if language == CAPTCHA_SCRIPT_ANY:
+        return CAPTCHA_SCRIPT_ANY
+    if (language or "").strip().lower() == "ru":
+        return CAPTCHA_SCRIPT_CYRILLIC
+    return CAPTCHA_SCRIPT_LATIN
+
+
+def _foreign_letters(text: str, script: str) -> list[str]:
+    """Символы чужого алфавита, которых не должно быть в ответе."""
+    if script == CAPTCHA_SCRIPT_LATIN:
+        foreign = {
+            ch.lower()
+            for ch in text
+            if "а" <= ch.lower() <= "я" or ch.lower() == "ё"
+        }
+    elif script == CAPTCHA_SCRIPT_CYRILLIC:
+        foreign = {ch.lower() for ch in text if "a" <= ch.lower() <= "z"}
+    else:
+        # ANY: принимаем оба алфавита.
+        return []
+    return sorted(foreign)
 
 
 @dataclass
@@ -174,6 +255,10 @@ class ChatOpenAI:
             **extra,
         }
 
+        return self._post_payload(payload)
+
+    def _post_payload(self, payload: dict) -> str:
+        """Отправка готового payload в /chat/completions с retry-логикой."""
         for attempt in range(self.max_retries + 1):
             try:
                 response = self._request(payload)
@@ -300,3 +385,110 @@ class ChatOpenAI:
             max_completion_tokens=max_completion_tokens,
             **extra,
         )
+
+    # --- Распознавание капчи -------------------------------------------
+
+    CAPTCHA_PROMPT_COMMON = _CAPTCHA_PROMPT_COMMON
+    CAPTCHA_PROMPT_RULES = _CAPTCHA_PROMPT_RULES
+    CAPTCHA_USER_PROMPT = _CAPTCHA_USER_PROMPT
+
+    def _captcha_payload(
+        self,
+        b64: str,
+        mime_type: str,
+        temperature: float,
+        script: str,
+    ) -> dict:
+        """Payload запроса к vision-модели с промптом нужного алфавита."""
+        payload: dict = {
+            "temperature": temperature,
+            "max_completion_tokens": 100,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        self.CAPTCHA_PROMPT_COMMON
+                        + self.CAPTCHA_PROMPT_RULES[script]
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{mime_type};base64,{b64}",
+                                "detail": "high",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": self.CAPTCHA_USER_PROMPT[script],
+                        },
+                    ],
+                },
+            ],
+        }
+        model = getattr(self, "model", None)
+        if model is not None:
+            payload["model"] = model
+        return payload
+
+    def read_captcha(
+        self,
+        data: bytes,
+        *,
+        script: str = CAPTCHA_SCRIPT_ANY,
+        mime_type: str = "image/png",
+        temperature: float | None = None,
+    ) -> str:
+        """Распознаёт капчу. Возвращает два слова через пробел."""
+        if not data:
+            raise OpenAIError("Empty image data")
+
+        b64 = base64.b64encode(data).decode("ascii")
+        payload = self._captcha_payload(
+            b64,
+            mime_type,
+            self.temperature if temperature is None else temperature,
+            script,
+        )
+
+        logger.debug("AI captcha запрос: %s, %d байт", mime_type, len(data))
+
+        raw = self._post_payload(payload)
+        return self._parse_captcha_json(raw, script)
+
+    @staticmethod
+    def _parse_captcha_json(raw: str, script: str) -> str:
+        """Разбирает JSON-ответ модели и проверяет алфавит."""
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            raise OpenAIError(
+                "В ответе модели нет JSON с распознанным текстом"
+            )
+
+        try:
+            data = json.loads(match.group(0))
+        except ValueError as ex:
+            raise OpenAIError(
+                f"Не удалось разобрать JSON ответа модели: {ex}"
+            ) from ex
+
+        if not isinstance(data, dict):
+            raise OpenAIError("В ответе модели нет объекта JSON")
+
+        first = str(data.get("first_word") or "").strip()
+        second = str(data.get("second_word") or "").strip()
+        if not first or not second:
+            raise OpenAIError("Модель распознала не оба слова")
+
+        for word in (first, second):
+            foreign = _foreign_letters(word, script)
+            if foreign:
+                raise OpenAIError(
+                    "Ответ содержит символы не того алфавита: "
+                    + "".join(foreign)
+                )
+
+        return f"{first} {second}".lower()

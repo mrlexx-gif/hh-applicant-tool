@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import io
 import logging
 import random
 import re
@@ -14,15 +15,19 @@ from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 from urllib.parse import (
+    quote,
     urlparse,
 )
 
 import requests
 
+from ..ai import captcha_script
 from ..ai.base import AIError
 from ..api import BadResponse, Redirect, datatypes
+from ..api.captcha import CaptchaError, CaptchaFlow
 from ..api.datatypes import PaginatedItems, SearchVacancy
 from ..api.errors import ApiError, LimitExceeded
+from ..constants import HH_BASE_URL
 from ..errors import OperationError
 from ..storage.repositories.errors import RepositoryError
 from ..tool import BaseNamespace, BaseOperation
@@ -108,6 +113,22 @@ DEFAULT_AI_FILTER_PROMPT = """\
 
 DEFAULT_APPLY_MAIL_SUBJECT = "{Отклик|Резюме} на вакансию %(vacancy_name)s"
 DEFAULT_APPLY_MAIL_BODY = "{Здравствуйте|Добрый день}, {прошу рассмотреть|пожалуйста рассмотрите} мое резюме %(resume_url)s на вакансию %(vacancy_name)s."
+
+# Параметры решения капчи. Флаг важнее config.json, config важнее
+# встроенного умолчания. Транспорт http — обычный requests, browser —
+# окно браузера.
+DEFAULT_CAPTCHA_TRANSPORT = "http"
+CAPTCHA_TRANSPORTS = ("http", "browser")
+CAPTCHA_LANGUAGE_DEFAULT = "en"
+CAPTCHA_LANGUAGES = ("en", "ru")
+# Сколько раз пробовать пройти капчу (каждая попытка — новая картинка).
+CAPTCHA_MAX_ATTEMPTS = 5
+# Как читать картинку: single — один ответ, samples — несколько
+# чтений одной картинки с выбором самого частого ответа.
+CAPTCHA_STRATEGY_DEFAULT = "samples"
+CAPTCHA_STRATEGIES = ("single", "samples")
+CAPTCHA_SAMPLES_DEFAULT = 3
+CAPTCHA_MIN_VOTES_DEFAULT = 2
 
 # Переменные, доступные в шаблонах. Нужны для проверки шаблонов до рассылки
 BASE_PLACEHOLDERS = (
@@ -251,6 +272,36 @@ class Operation(BaseOperation):
             help="Путь для сохранения картинки капчи, когда требуется ручной ввод (например, captcha.png). Если не указан, картинка выводится в терминал (kitty/sixel) или сохраняется во временный файл.",
             type=Path,
             default=None,
+        )
+        parser.add_argument(
+            "--captcha-transport",
+            choices=list(CAPTCHA_TRANSPORTS),
+            default=None,
+            help="Чем проходить капчу: http (requests) или browser. По умолчанию http.",
+        )
+        parser.add_argument(
+            "--captcha-language",
+            choices=list(CAPTCHA_LANGUAGES),
+            default=None,
+            help="Язык картинки капчи: en (латиница) или ru (кириллица). По умолчанию en.",
+        )
+        parser.add_argument(
+            "--captcha-strategy",
+            choices=["single", "samples"],
+            default=None,
+            help="Как решать капчу: single — один ответ, samples — несколько попыток с голосованием.",
+        )
+        parser.add_argument(
+            "--captcha-samples",
+            type=int,
+            default=None,
+            help="Сколько раз распознать капчу для стратегии samples.",
+        )
+        parser.add_argument(
+            "--captcha-min-votes",
+            type=int,
+            default=None,
+            help="Сколько голосов нужно для принятия ответа в стратегии samples.",
         )
         parser.add_argument(
             "--total-pages",
@@ -424,12 +475,297 @@ class Operation(BaseOperation):
     def api_client(self):
         return self.tool.api_client
 
+    def _raw_captcha_setting(self, name: str):
+        """Значение настройки капчи: флаг операции либо config."""
+        args = getattr(self, "_args", None)
+        value = getattr(args, name, None) if args is not None else None
+        if value is None:
+            config = getattr(self.tool, "config", None)
+            if config is not None:
+                value = config.get(name)
+        return value
+
+    def _resolve_captcha_setting(
+        self,
+        name: str,
+        allowed: tuple[str, ...],
+        default: str,
+    ) -> str:
+        """Флаг важнее config.json, config важнее встроенного умолчания."""
+        value = self._raw_captcha_setting(name)
+        if value is None:
+            return default
+        normalized = str(value).strip().lower()
+        return normalized if normalized in allowed else default
+
+    def _captcha_int_setting(
+        self, name: str, default: int, minimum: int = 1
+    ) -> int:
+        value = self._raw_captcha_setting(name)
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return default
+        return number if number >= minimum else default
+
+    def _captcha_strategy(self) -> str:
+        return self._resolve_captcha_setting(
+            "captcha_strategy",
+            CAPTCHA_STRATEGIES,
+            CAPTCHA_STRATEGY_DEFAULT,
+        )
+
+    def _captcha_samples(self) -> int:
+        return self._captcha_int_setting(
+            "captcha_samples", CAPTCHA_SAMPLES_DEFAULT
+        )
+
+    def _captcha_min_votes(self) -> int:
+        return self._captcha_int_setting(
+            "captcha_min_votes", CAPTCHA_MIN_VOTES_DEFAULT
+        )
+
+    def _captcha_transport(self) -> str:
+        return self._resolve_captcha_setting(
+            "captcha_transport",
+            CAPTCHA_TRANSPORTS,
+            DEFAULT_CAPTCHA_TRANSPORT,
+        )
+
+    def _captcha_language(self) -> str:
+        return self._resolve_captcha_setting(
+            "captcha_language",
+            CAPTCHA_LANGUAGES,
+            CAPTCHA_LANGUAGE_DEFAULT,
+        )
+
+    def _manual_captcha_enabled(self) -> bool:
+        args = getattr(self, "_args", None)
+        value = (
+            getattr(args, "manual_captcha", None)
+            if args is not None
+            else None
+        )
+        return True if value is None else bool(value)
+
+    @staticmethod
+    def _preprocess_captcha(image_data: bytes) -> bytes:
+        """Увеличивает картинку: мелкий текст капчи модели читать легче.
+
+        Капчи hh.ru приходят мелкми (~120x60 px); апскейл заметно
+        повышает точность распознавания. При любой ошибке — оригинал.
+        """
+        try:
+            from PIL import Image
+        except Exception:  # noqa: BLE001
+            return image_data
+        try:
+            with Image.open(io.BytesIO(image_data)) as image:
+                image = image.convert("RGB")
+                width, height = image.size
+                if width and width < 320:
+                    scale = max(2, 400 // width)
+                    image = image.resize(
+                        (width * scale, height * scale), Image.LANCZOS
+                    )
+                out = io.BytesIO()
+                image.save(out, format="PNG")
+                return out.getvalue()
+        except Exception as ex:  # noqa: BLE001
+            logger.debug("Не удалось подготовить капчу: %s", ex)
+            return image_data
+
+    def _recognize_captcha_ai(self, image_data: bytes) -> str | None:
+        """Одно чтение (single) либо несколько с голосованием (samples)."""
+        # Язык берём из настройки операции (--captcha-language/config),
+        # чтобы флаг действовал одинаково в обеих стратегиях.
+        script = captcha_script(self._captcha_language())
+        if self._captcha_strategy() == "single":
+            try:
+                return self.tool.captcha_ai.read_captcha(
+                    image_data, script=script
+                )
+            except AIError as ex:
+                logger.warning("AI не распознал капчу: %s", ex)
+                return None
+            except Exception as ex:  # noqa: BLE001
+                logger.error("Ошибка распознавания капчи: %s", ex)
+                return None
+
+        samples = self._captcha_samples()
+        min_votes = self._captcha_min_votes()
+        votes: dict[str, int] = {}
+        for _ in range(samples):
+            try:
+                text = self.tool.captcha_ai.read_captcha(
+                    image_data,
+                    script=script,
+                    temperature=self.tool.captcha_ai.temperature,
+                )
+            except Exception as ex:  # noqa: BLE001
+                logger.debug("AI captcha: ошибка сэмпла: %s", ex)
+                continue
+            if text:
+                votes[text] = votes.get(text, 0) + 1
+
+        if not votes:
+            return None
+        best, count = max(votes.items(), key=lambda kv: kv[1])
+        logger.debug(
+            "Голосование капчи (%d сэмплов, порог %d): %r",
+            samples,
+            min_votes,
+            votes,
+        )
+        return best if count >= min_votes else None
+
+    def _recognize_captcha(self, image_data: bytes) -> str | None:
+        """Распознаёт картинку: сначала AI, при неудаче — ручной ввод."""
+        prepared = self._preprocess_captcha(image_data)
+        if self.tool.use_ai:
+            text = self._recognize_captcha_ai(prepared)
+            if text:
+                logger.debug("Распознанный текст капчи: %r", text)
+                return text
+
+        if not self._manual_captcha_enabled():
+            return None
+
+        try:
+            text = self.tool._solve_captcha_manual(image_data)
+            return text or None
+        except KeyboardInterrupt:
+            raise
+        except Exception as ex:  # noqa: BLE001
+            logger.error("Ручной ввод капчи не удался: %s", ex)
+            return None
+
+    @staticmethod
+    def _captcha_state_from(data: Any) -> str | None:
+        """Достаёт captchaState из JSON-ответа hh.ru (XHR)."""
+        if not isinstance(data, dict):
+            return None
+        for section in ("hhcaptcha", "recaptcha"):
+            value = data.get(section)
+            if isinstance(value, dict) and value.get("captchaState"):
+                return value["captchaState"]
+        return None
+
+    def _solve_inline_captcha(
+        self, *, referer_url: str | None = None
+    ) -> tuple[str, str] | None:
+        """Картинка + распознанный текст для капчи из XHR-ответа.
+
+        Возвращает ``(text, key)`` либо None. Такую капчу нельзя
+        отправлять на ``/account/captcha``: ответ надо добавить полями
+        ``captchaText``/``captchaKey``/``captchaState`` к исходному
+        XHR-запросу (как в authorize.py для otp_generate).
+        """
+        try:
+            image = self.tool.get_captcha_image(
+                lang=self._captcha_language(),
+                referer_url=referer_url,
+            )
+        except Exception as ex:  # noqa: BLE001
+            logger.warning("Не удалось получить картинку капчи: %s", ex)
+            return None
+
+        text = self._recognize_captcha(image.data)
+        if not text:
+            return None
+
+        return text, image.key
+
+    def _solve_captcha_challenge(
+        self,
+        *,
+        captcha_state: str | None = None,
+        captcha_url: str | None = None,
+    ) -> bool:
+        """Получает картинку, решает и отправляет ответ.
+
+        Возвращает True, если hh.ru принял ответ. Работает и по готовой
+        ссылке на страницу капчи (403 от API), и по одному лишь
+        ``captchaState`` из JSON-ответа XHR.
+        """
+        standalone = captcha_url is not None
+        if not captcha_url:
+            base_url = getattr(self.tool, "base_url", None) or HH_BASE_URL
+            captcha_url = (
+                base_url.rstrip("/")
+                + "/account/captcha?state="
+                + quote(captcha_state or "")
+            )
+
+        flow = CaptchaFlow(
+            self.tool.session,
+            captcha_url,
+            language=self._captcha_language(),
+        )
+
+        if standalone:
+            try:
+                flow.prime()
+            except Exception as ex:  # noqa: BLE001
+                logger.debug("Не удалось открыть страницу капчи: %s", ex)
+
+        for attempt in range(1, CAPTCHA_MAX_ATTEMPTS + 1):
+            try:
+                image = flow.fetch()
+            except CaptchaError as ex:
+                logger.warning(
+                    "Не удалось получить картинку капчи (%d/%d): %s",
+                    attempt,
+                    CAPTCHA_MAX_ATTEMPTS,
+                    ex,
+                )
+                continue
+
+            text = self._recognize_captcha(image.image)
+            if not text:
+                logger.warning(
+                    "Капча не распознана (%d/%d)",
+                    attempt,
+                    CAPTCHA_MAX_ATTEMPTS,
+                )
+                continue
+
+            try:
+                result = flow.submit(text, key=image.key)
+            except CaptchaError as ex:
+                logger.warning("Не удалось отправить ответ капчи: %s", ex)
+                continue
+
+            if result.accepted:
+                logger.info("Капча пройдена (%s)", result.reason)
+                return True
+
+            logger.warning(
+                "Капча отклонена (%s), попытка %d/%d",
+                result.reason,
+                attempt,
+                CAPTCHA_MAX_ATTEMPTS,
+            )
+
+        logger.error("Не удалось пройти капчу за %d попыток", CAPTCHA_MAX_ATTEMPTS)
+        return False
+
+    def _api_captcha_handler(self, captcha_url: str) -> bool:
+        """Callback для ApiClient: решает капчу по captcha_url."""
+        return self._solve_captcha_challenge(captcha_url=captcha_url)
+
     def run(
         self,
         tool: HHApplicantTool,
         args: Namespace,
     ) -> None:
         self.tool = tool
+        # Namespace с аргументами операции: нужен для ленивого разрешения
+        # настроек капчи (_captcha_transport/_captcha_language).
+        self._args = args
+        # Когда API отвечает 403 captcha_required, BaseClient зовёт этот
+        # обработчик и повторяет исходный запрос.
+        tool.api_client.captcha_handler = self._api_captcha_handler
         config = tool.config
         self.cover_letter = args.cover_letter or config.get(
             "cover_letter", self.cover_letter
@@ -457,7 +793,7 @@ class Operation(BaseOperation):
         # промпт AI, чтобы ответы на вопросы тестов и письма были
         # персонализированными
         self._user_context = self._load_user_context(args.context_dir)
-        system_prompt = args.system_prompt
+        system_prompt = args.cover_letter_system_prompt or ""
         if self._user_context:
             system_prompt += (
                 "\n\nИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ "
@@ -465,29 +801,28 @@ class Operation(BaseOperation):
                 "своих ответов):\n" + self._user_context
             )
             logger.debug("Системный промпт с контекстом пользователя: %r", system_prompt)
-        self.cover_letter_ai = (
-            tool.get_cover_letter_ai(system_prompt)
-            if args.use_ai
-            else None
-        )
-        self.ai_filter = args.ai_filter
-        self.ai_filter_prompt = args.ai_filter_prompt
         self.ai_filter = bool(args.ai_filter)
+        self.cover_letter_prompt = (
+            args.cover_letter_prompt or DEFAULT_COVER_LETTER_PROMPT
+        )
+        self.ai_filter_prompt = (
+            args.ai_filter_prompt or DEFAULT_AI_FILTER_PROMPT
+        )
 
         self.cover_letter_ai = self.vacancy_filter_ai = None
         if args.use_ai:
             c = tool.get_openai_config("openai.cover_letter")
             c.setdefault("system_prompt", DEFAULT_COVER_LETTER_SYSTEM_PROMPT)
             c.setdefault("temperature", 0.8)
-            if args.cover_letter_system_prompt:
-                c["system_propmpt"] = args.cover_letter_system_prompt
+            if system_prompt:
+                c["system_prompt"] = system_prompt
             self.cover_letter_ai = tool.get_ai_client(**c)
 
             if self.ai_filter:
                 c = tool.get_openai_config("openai.vacancy_filter")
-                c.setdefault("system_propmt", DEFAULT_AI_FILTER_PROMPT)
+                c.setdefault("system_prompt", DEFAULT_AI_FILTER_SYSTEM_PROMPT)
                 if args.ai_filter_system_prompt:
-                    c["system_propmpt"] = args.cover_letter_system_prompt
+                    c["system_prompt"] = args.ai_filter_system_prompt
                 self.vacancy_filter_ai = tool.get_ai_client(**c)
 
         self.apply_mail_subject = (
@@ -841,6 +1176,18 @@ class Operation(BaseOperation):
             resume["title"],
         )
         print("🚀 Начинаю рассылку откликов для резюме:", resume["title"])
+        # ВАЛИДАЦИЯ captcha: видно, чем и как мы вообще собираемся её
+        # решать. Если handler=None и все *_ai/kitty/sixel=False, капчу
+        # физически нечем проходить.
+        logger.debug(
+            "ВАЛИДАЦИЯ captcha: handler=%r use_ai=%s kitty=%s sixel=%s "
+            "captcha_lang=%s",
+            getattr(self.api_client, "captcha_handler", None),
+            getattr(self.tool, "use_ai", None),
+            getattr(self.tool, "use_kitty", None),
+            getattr(self.tool, "use_sixel", None),
+            getattr(self.tool, "captcha_lang", None),
+        )
         applied_count = 0
         limit_reached = False
 
@@ -1095,6 +1442,18 @@ class Operation(BaseOperation):
                                     )
                                     break
                                 else:
+                                    hhcaptcha = (
+                                        result.get("hhcaptcha")
+                                        if isinstance(result, dict)
+                                        else None
+                                    )
+                                    if hhcaptcha:
+                                        logger.error(
+                                            "Капчу для отклика на тест %s "
+                                            "пройти не удалось (isBot=%r)",
+                                            vacancy["alternate_url"],
+                                            hhcaptcha.get("isBot"),
+                                        )
                                     logger.error(
                                         "Произошла ошибка при отклике на вакансию с тестом: %s, result: %.300s",
                                         vacancy["alternate_url"],
@@ -1168,6 +1527,15 @@ class Operation(BaseOperation):
                 )
                 break
             except ApiError as ex:
+                # ВАЛИДАЦИЯ captcha: 403 captcha_required прилетает сюда.
+                logger.debug(
+                    "ВАЛИДАЦИЯ captcha: API-ошибка на вакансии %s: %s "
+                    "captcha_url=%r handler=%r",
+                    vacancy.get("alternate_url"),
+                    type(ex).__name__,
+                    getattr(ex, "captcha_url", None),
+                    getattr(self.api_client, "captcha_handler", None),
+                )
                 logger.warning(ex)
             except (BadResponse, AIError) as ex:
                 logger.error(ex)
@@ -1307,40 +1675,77 @@ class Operation(BaseOperation):
         # Ожидание перед отправкой (float)
         time.sleep(random.uniform(2.0, 3.0))
 
-        response = self.tool.session.post(
-            "https://hh.ru/applicant/vacancy_response/popup",
-            data=payload,
-            headers={
-                "Referer": response_url,
-                # x-gib-fgsscgib-w-hh и x-gib-gsscgib-w-hh вроде в куках
-                # передаются и не нужны
-                "X-Hhtmfrom": "vacancy",
-                "X-Hhtmsource": "vacancy_response",
-                "X-Requested-With": "XMLHttpRequest",
-                "X-Xsrftoken": self.tool.xsrf_token,
-            },
-        )
+        headers = {
+            "Referer": response_url,
+            # x-gib-fgsscgib-w-hh и x-gib-gsscgib-w-hh вроде в куках
+            # передаются и не нужны
+            "X-Hhtmfrom": "vacancy",
+            "X-Hhtmsource": "vacancy_response",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-Xsrftoken": self.tool.xsrf_token,
+        }
 
-        logger.debug(
-            "%s %s %d",
-            response.request.method,
-            response.url,
-            response.status_code,
-        )
-
-        try:
-            data = response.json()
-        except (ValueError, requests.exceptions.JSONDecodeError) as ex:
-            logger.warning(
-                "Ответ на отклик с тестом не является JSON (status=%s, %s), result: %s",
-                response.status_code,
-                response.url,
-                shorten(response.text, 300),
+        data: Any = {}
+        for attempt in range(1, CAPTCHA_MAX_ATTEMPTS + 1):
+            response = self.tool.session.post(
+                "https://hh.ru/applicant/vacancy_response/popup",
+                data=payload,
+                headers=headers,
             )
-            raise ValueError(
-                "Эндпоинт отклика на тест вернул не-JSON ответ "
-                "(возможно, перенаправление на капчу или форму)."
-            ) from ex
+
+            logger.debug(
+                "%s %s %d",
+                response.request.method,
+                response.url,
+                response.status_code,
+            )
+
+            try:
+                data = response.json()
+            except (ValueError, requests.exceptions.JSONDecodeError) as ex:
+                logger.warning(
+                    "Ответ на отклик с тестом не является JSON (status=%s, %s), result: %s",
+                    response.status_code,
+                    response.url,
+                    shorten(response.text, 300),
+                )
+                raise ValueError(
+                    "Эндпоинт отклика на тест вернул не-JSON ответ "
+                    "(возможно, перенаправление на капчу или форму)."
+                ) from ex
+
+            captcha_state = self._captcha_state_from(data)
+            if not captcha_state:
+                logger.debug(
+                    "ВАЛИДАЦИЯ captcha: отклик на тест %s без капчи, "
+                    "ключи=%s",
+                    vacancy_id,
+                    list(data)
+                    if isinstance(data, dict)
+                    else type(data).__name__,
+                )
+                return data
+
+            logger.warning(
+                "Отклик на тест %s требует капчу, попытка %d/%d",
+                vacancy_id,
+                attempt,
+                CAPTCHA_MAX_ATTEMPTS,
+            )
+
+            solved = self._solve_inline_captcha(referer_url=response_url)
+            if not solved:
+                logger.error(
+                    "Капча для отклика на тест %s не пройдена", vacancy_id
+                )
+                return data
+
+            # Ответ капчи едет теми же полями в исходный XHR-запрос,
+            # а не отдельным POST на /account/captcha.
+            captcha_text, captcha_key = solved
+            payload["captchaText"] = captcha_text
+            payload["captchaKey"] = captcha_key
+            payload["captchaState"] = captcha_state
 
         return data
 

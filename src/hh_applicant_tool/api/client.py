@@ -169,13 +169,50 @@ class BaseClient:
                         f"({response.status_code})"
                     ) from ex
 
-            # CaptchaRequired и прочие ошибки пробрасываются наверх
-            errors.ApiError.raise_for_status(response, rv)
+            try:
+                errors.ApiError.raise_for_status(response, rv)
+            except errors.CaptchaRequired as ex:
+                # API требует капчу: просим handler её пройти и повторяем
+                # запрос. Если пройти не удалось или попытки кончились —
+                # пробрасываем ошибку наверх.
+                if attempt >= self.max_retries or not (
+                    self._solve_api_captcha(ex)
+                ):
+                    raise
+                continue
+
             return rv
 
         # Все попытки закончились ошибками соединения
         assert last_exc is not None
         raise last_exc
+
+    def _solve_api_captcha(self, ex: errors.CaptchaRequired) -> bool:
+        """Просит captcha_handler пройти капчу. True — можно повторить."""
+        handler = self.captcha_handler
+        captcha_url = getattr(ex, "captcha_url", None)
+        if handler is None or not captcha_url:
+            logger.warning(
+                "Требуется капча (%s), но captcha_handler не настроен",
+                captcha_url,
+            )
+            return False
+
+        with self._captcha_lock:
+            logger.info("Требуется капча, проходим: %s", captcha_url)
+            try:
+                solved = bool(handler(captcha_url))
+            except Exception as handler_ex:  # noqa: BLE001
+                logger.error("Ошибка прохождения капчи: %s", handler_ex)
+                return False
+
+        if not solved:
+            logger.warning("Капча не пройдена: %s", captcha_url)
+            return False
+
+        if self.captcha_cooldown:
+            time.sleep(self.captcha_cooldown)
+        return True
 
     def get(self, *args, **kwargs) -> T:
         return self.request("GET", *args, **kwargs)
