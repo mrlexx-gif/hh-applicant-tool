@@ -459,11 +459,18 @@ class HHApplicantTool:
                     )
                 )
 
-        c = self.config.get(base_section) or {}
+        openai_config = self.config.get(base_section) or {}
+        # Обратная совместимость со старым «плоским» форматом конфига,
+        # где секции задавались одним ключом через подчёркивание:
+        # "openai.cover_letter" -> "openai_cover_letter".
+        legacy_section = self.config.get(f"{base_section}_{section}") or {}
+        if not isinstance(legacy_section, dict):
+            legacy_section = {}
         c = deepcopy(
             {
-                **(c.get("default") or {}),
-                **(c.get(section) or {}),
+                **(openai_config.get(default_section) or {}),
+                **legacy_section,
+                **(openai_config.get(section) or {}),
             }
         )
 
@@ -487,6 +494,7 @@ class HHApplicantTool:
             for k, v in c.items()
             if k
             in [
+                "api_key",
                 "base_url",
                 "connect_timeout",
                 "delay",

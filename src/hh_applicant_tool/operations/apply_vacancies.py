@@ -771,6 +771,14 @@ class Operation(BaseOperation):
         self.skip_tests = args.skip_tests
         self.total_pages = args.total_pages
 
+        # Пользовательский контекст (*.md): содержимое всех *.md файлов
+        # добавляется в системный промпт AI, чтобы письма и ответы на тесты
+        # были персонализированы. Флаг --context-dir приоритетнее конфига.
+        context_dir = args.context_dir or config.get("context_dir")
+        if context_dir is not None and not isinstance(context_dir, Path):
+            context_dir = Path(context_dir)
+        self._user_context = self._load_user_context(context_dir)
+
         # Приоритет: аргумент командной строки -> конфиг -> дефолтная константа
         # Системные промпты - обычный текст, пользовательские - шаблоны
         self.cover_letter_prompt = (
@@ -784,25 +792,32 @@ class Operation(BaseOperation):
             or DEFAULT_AI_FILTER_PROMPT
         )
         self.ai_filter = bool(args.ai_filter)
-        self.cover_letter_prompt = (
-            args.cover_letter_prompt or DEFAULT_COVER_LETTER_PROMPT
-        )
-        self.ai_filter_prompt = (
-            args.ai_filter_prompt or DEFAULT_AI_FILTER_PROMPT
-        )
 
         self.cover_letter_ai = self.vacancy_filter_ai = None
         if args.use_ai:
             c = tool.get_openai_args("openai.cover_letter")
             c.setdefault("system_prompt", DEFAULT_COVER_LETTER_SYSTEM_PROMPT)
             c.setdefault("temperature", 0.8)
-            if system_prompt:
-                c["system_prompt"] = system_prompt
+            if args.cover_letter_system_prompt:
+                c["system_prompt"] = args.cover_letter_system_prompt
+            if self._user_context:
+                c["system_prompt"] = (
+                    c["system_prompt"]
+                    + "\n\nИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ "
+                    "(обязательно используй эти данные для персонализации "
+                    "своих ответов):\n"
+                    + self._user_context
+                )
+                logger.debug(
+                    "Системный промпт AI с контекстом пользователя готов"
+                )
             self.cover_letter_ai = tool.get_ai_client(**c)
 
             if self.ai_filter:
                 c = tool.get_openai_args("openai.vacancy_filter")
-                c.setdefault("system_propmt", DEFAULT_AI_FILTER_PROMPT)
+                c.setdefault(
+                    "system_prompt", DEFAULT_AI_FILTER_SYSTEM_PROMPT
+                )
                 if args.ai_filter_system_prompt:
                     c["system_prompt"] = args.ai_filter_system_prompt
                 self.vacancy_filter_ai = tool.get_ai_client(**c)
@@ -815,6 +830,42 @@ class Operation(BaseOperation):
         )
 
         self._apply_vacancies()
+
+    def _load_user_context(self, context_dir: Path | None) -> str:
+        """Загружает пользовательский контекст из всех *.md файлов директории."""
+        if not context_dir:
+            return ""
+        if not context_dir.is_dir():
+            logger.warning("Директория контекста не найдена: %s", context_dir)
+            return ""
+
+        parts = []
+        for md_file in sorted(context_dir.glob("*.md")):
+            try:
+                content = md_file.read_text(encoding="utf-8").strip()
+            except OSError as ex:
+                logger.warning(
+                    "Не удалось прочитать файл контекста %s: %s",
+                    md_file,
+                    ex,
+                )
+                continue
+            if content:
+                parts.append(f"--- {md_file.name} ---\n{content}")
+                logger.debug(
+                    "Загружен файл контекста: %s (%d символов)",
+                    md_file.name,
+                    len(content),
+                )
+
+        context = "\n\n".join(parts)
+        if context:
+            logger.info(
+                "Загружен пользовательский контекст из %d файлов (%d символов)",
+                len(parts),
+                len(context),
+            )
+        return context
 
     def _get_resume_info(self, resume_id: str | None) -> dict[str, str]:
         """Данные резюме для подстановки в шаблон промпта AI-фильтра."""

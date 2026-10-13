@@ -32,10 +32,12 @@ def mock_tool():
         "client_secret": "secret_123",
         "token": {"access_token": "tok_abc", "refresh_token": "ref_xyz"},
         "proxy_url": "socks5://user:pass@localhost:1080",
-        "openai_cover_letter": {
-            "api_key": "sk-test-00000000000000000000",
-            "base_url": "https://api.openai.com",
-            "model": "gpt-4",
+        "openai": {
+            "cover_letter": {
+                "api_key": "sk-test-00000000000000000000",
+                "base_url": "https://api.openai.com",
+                "model": "gpt-4",
+            },
         },
         "smtp": {
             "host": "smtp.example.com",
@@ -102,10 +104,13 @@ class TestConfig:
     def test_get_config_masks_nested_secrets(self, api):
         """Вложенные api_key, password маскируются рекурсивно."""
         config = api.get_config()
-        assert config["openai_cover_letter"]["api_key"] == "***"
+        assert config["openai"]["cover_letter"]["api_key"] == "***"
         # Несекретные поля внутри вложенного dict остаются видны
-        assert config["openai_cover_letter"]["base_url"] == "https://api.openai.com"
-        assert config["openai_cover_letter"]["model"] == "gpt-4"
+        assert (
+            config["openai"]["cover_letter"]["base_url"]
+            == "https://api.openai.com"
+        )
+        assert config["openai"]["cover_letter"]["model"] == "gpt-4"
         assert config["smtp"]["password"] == "***"
         assert config["smtp"]["host"] == "smtp.example.com"
         assert config["smtp"]["user"] == "me@example.com"
@@ -134,23 +139,33 @@ class TestConfig:
         captured = {}
         mock_tool.config.save = lambda **kw: captured.update(kw)
         api.save_config({
-            "openai_cover_letter": {
-                "api_key": "***",
-                "model": "gpt-4-turbo",
+            "openai": {
+                "cover_letter": {
+                    "api_key": "***",
+                    "model": "gpt-4-turbo",
+                }
             }
         })
         # api_key="***" stripped — existing key preserved via merge, model updated
-        assert captured["openai_cover_letter"]["model"] == "gpt-4-turbo"
-        assert captured["openai_cover_letter"]["api_key"] == "sk-test-00000000000000000000"
+        assert captured["openai"]["cover_letter"]["model"] == "gpt-4-turbo"
+        assert (
+            captured["openai"]["cover_letter"]["api_key"]
+            == "sk-test-00000000000000000000"
+        )
 
     def test_save_config_preserves_omitted_nested_secret(self, api, mock_tool):
         api.save_config({
-            "openai_cover_letter": {
-                "model": "gpt-4.1",
+            "openai": {
+                "cover_letter": {
+                    "model": "gpt-4.1",
+                }
             }
         })
-        assert mock_tool.config["openai_cover_letter"]["api_key"] == "sk-test-00000000000000000000"
-        assert mock_tool.config["openai_cover_letter"]["model"] == "gpt-4.1"
+        assert (
+            mock_tool.config["openai"]["cover_letter"]["api_key"]
+            == "sk-test-00000000000000000000"
+        )
+        assert mock_tool.config["openai"]["cover_letter"]["model"] == "gpt-4.1"
 
     def test_save_config_preserves_value_types(self, api, mock_tool):
         api.save_config({
