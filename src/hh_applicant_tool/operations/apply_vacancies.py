@@ -118,6 +118,22 @@ DEFAULT_AI_FILTER_PROMPT = """\
 DEFAULT_APPLY_MAIL_SUBJECT = "{Отклик|Резюме} на вакансию %(vacancy_name)s"
 DEFAULT_APPLY_MAIL_BODY = "{Здравствуйте|Добрый день}, {прошу рассмотреть|пожалуйста рассмотрите} мое резюме %(resume_url)s на вакансию %(vacancy_name)s."
 
+# Параметры решения капчи. Флаг важнее config.json, config важнее
+# встроенного умолчания. Транспорт http — обычный requests, browser —
+# окно браузера.
+DEFAULT_CAPTCHA_TRANSPORT = "http"
+CAPTCHA_TRANSPORTS = ("http", "browser")
+CAPTCHA_LANGUAGE_DEFAULT = "en"
+CAPTCHA_LANGUAGES = ("en", "ru")
+# Сколько раз пробовать пройти капчу (каждая попытка — новая картинка).
+CAPTCHA_MAX_ATTEMPTS = 5
+# Как читать картинку: single — один ответ, samples — несколько
+# чтений одной картинки с выбором самого частого ответа.
+CAPTCHA_STRATEGY_DEFAULT = "samples"
+CAPTCHA_STRATEGIES = ("single", "samples")
+CAPTCHA_SAMPLES_DEFAULT = 3
+CAPTCHA_MIN_VOTES_DEFAULT = 2
+
 
 class Namespace(BaseNamespace):
     resume_id: str | None
