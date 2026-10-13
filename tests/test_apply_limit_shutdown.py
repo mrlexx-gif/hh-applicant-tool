@@ -37,7 +37,6 @@ def _make_operation(max_responses: int = 5) -> Operation:
         letter_file=None,
         use_ai=False,
         system_prompt="",
-        ai_rate_limit=0,
     )
     op.max_responses = max_responses
     op.dry_run = False

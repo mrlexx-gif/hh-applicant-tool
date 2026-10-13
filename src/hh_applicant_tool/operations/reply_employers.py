@@ -135,7 +135,7 @@ class Operation(BaseOperation):
 
         self.reply_chat_ai = None
         if args.use_ai:
-            c = tool.get_openai_config("openai.reply_chat")
+            c = tool.get_openai_args("openai.reply_chat")
             c.setdefault("system_prompt", DEFAULT_SYSTEM_PROMPT)
             if system_prompt:
                 c["system_prompt"] = system_prompt

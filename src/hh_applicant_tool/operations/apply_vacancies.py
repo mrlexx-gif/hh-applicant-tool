@@ -1,5 +1,4 @@
-# Мне не хватило терпения, поэтому я попросил нейрослоп bleed'а и ко удалить
-# Claude
+# Этот код, блять, уродлив. Просто ужасен
 from __future__ import annotations
 
 import argparse
@@ -39,7 +38,6 @@ from ..utils.string import (
     render_template,
     shorten,
     strip_tags,
-    unescape_string,
 )
 
 if TYPE_CHECKING:
@@ -83,6 +81,12 @@ SEARCH_PARAM_NAMES = (
 
 DEFAULT_PER_PAGE = 100
 
+DEFAULT_COVER_LETTER = """\
+{Здравствуйте|Добрый день}, меня зовут %(first_name)s.\
+ {Прошу|Предлагаю} рассмотреть {мою кандидатуру|мое резюме «%(resume_title)s} на вакансию «%(vacancy_name)s».\
+ С уважением, %(first_name)s."""
+
+
 # Системные промпты - простые строки, не шаблоны
 DEFAULT_COVER_LETTER_SYSTEM_PROMPT = (
     "Ты помогаешь соискателю писать сопроводительные письма. "
@@ -113,43 +117,6 @@ DEFAULT_AI_FILTER_PROMPT = """\
 
 DEFAULT_APPLY_MAIL_SUBJECT = "{Отклик|Резюме} на вакансию %(vacancy_name)s"
 DEFAULT_APPLY_MAIL_BODY = "{Здравствуйте|Добрый день}, {прошу рассмотреть|пожалуйста рассмотрите} мое резюме %(resume_url)s на вакансию %(vacancy_name)s."
-
-# Параметры решения капчи. Флаг важнее config.json, config важнее
-# встроенного умолчания. Транспорт http — обычный requests, browser —
-# окно браузера.
-DEFAULT_CAPTCHA_TRANSPORT = "http"
-CAPTCHA_TRANSPORTS = ("http", "browser")
-CAPTCHA_LANGUAGE_DEFAULT = "en"
-CAPTCHA_LANGUAGES = ("en", "ru")
-# Сколько раз пробовать пройти капчу (каждая попытка — новая картинка).
-CAPTCHA_MAX_ATTEMPTS = 5
-# Как читать картинку: single — один ответ, samples — несколько
-# чтений одной картинки с выбором самого частого ответа.
-CAPTCHA_STRATEGY_DEFAULT = "samples"
-CAPTCHA_STRATEGIES = ("single", "samples")
-CAPTCHA_SAMPLES_DEFAULT = 3
-CAPTCHA_MIN_VOTES_DEFAULT = 2
-
-# Переменные, доступные в шаблонах. Нужны для проверки шаблонов до рассылки
-BASE_PLACEHOLDERS = (
-    "first_name",
-    "last_name",
-    "email",
-    "phone",
-    "resume_hash",
-    "resume_title",
-    "resume_url",
-    "vacancy_name",
-    "vacancy_url",
-    "employer_name",
-)
-AI_FILTER_PLACEHOLDERS = BASE_PLACEHOLDERS + (
-    "resume_skills",
-    "resume_about",
-    "resume_experience",
-    "vacancy_description",
-    "vacancy_key_skills",
-)
 
 
 class Namespace(BaseNamespace):
@@ -469,8 +436,6 @@ class Operation(BaseOperation):
             help="Поля поиска (name, company_name и т.п.)",
         )
 
-    cover_letter: str = "{Здравствуйте|Добрый день}, меня зовут %(first_name)s. {Прошу|Предлагаю} рассмотреть {мою кандидатуру|мое резюме «%(resume_title)s»} на вакансию «%(vacancy_name)s». С уважением, %(first_name)s."
-
     @property
     def api_client(self):
         return self.tool.api_client
@@ -768,7 +733,7 @@ class Operation(BaseOperation):
         tool.api_client.captcha_handler = self._api_captcha_handler
         config = tool.config
         self.cover_letter = args.cover_letter or config.get(
-            "cover_letter", self.cover_letter
+            "cover_letter", DEFAULT_COVER_LETTER
         )
         for name in SEARCH_PARAM_NAMES:
             setattr(self, name, getattr(args, name))
@@ -789,18 +754,19 @@ class Operation(BaseOperation):
         self.send_email = args.send_email
         self.skip_tests = args.skip_tests
         self.total_pages = args.total_pages
-        # Загружаем пользовательский контекст (*.md) и добавляем его в системный
-        # промпт AI, чтобы ответы на вопросы тестов и письма были
-        # персонализированными
-        self._user_context = self._load_user_context(args.context_dir)
-        system_prompt = args.cover_letter_system_prompt or ""
-        if self._user_context:
-            system_prompt += (
-                "\n\nИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ "
-                "(обязательно используй эти данные для персонализации "
-                "своих ответов):\n" + self._user_context
-            )
-            logger.debug("Системный промпт с контекстом пользователя: %r", system_prompt)
+
+        # Приоритет: аргумент командной строки -> конфиг -> дефолтная константа
+        # Системные промпты - обычный текст, пользовательские - шаблоны
+        self.cover_letter_prompt = (
+            args.cover_letter_prompt
+            or config.get("cover_letter_prompt")
+            or DEFAULT_COVER_LETTER_PROMPT
+        )
+        self.ai_filter_prompt = (
+            args.ai_filter_prompt
+            or config.get("ai_filter_prompt")
+            or DEFAULT_AI_FILTER_PROMPT
+        )
         self.ai_filter = bool(args.ai_filter)
         self.cover_letter_prompt = (
             args.cover_letter_prompt or DEFAULT_COVER_LETTER_PROMPT
@@ -811,7 +777,7 @@ class Operation(BaseOperation):
 
         self.cover_letter_ai = self.vacancy_filter_ai = None
         if args.use_ai:
-            c = tool.get_openai_config("openai.cover_letter")
+            c = tool.get_openai_args("openai.cover_letter")
             c.setdefault("system_prompt", DEFAULT_COVER_LETTER_SYSTEM_PROMPT)
             c.setdefault("temperature", 0.8)
             if system_prompt:
@@ -819,8 +785,8 @@ class Operation(BaseOperation):
             self.cover_letter_ai = tool.get_ai_client(**c)
 
             if self.ai_filter:
-                c = tool.get_openai_config("openai.vacancy_filter")
-                c.setdefault("system_prompt", DEFAULT_AI_FILTER_SYSTEM_PROMPT)
+                c = tool.get_openai_args("openai.vacancy_filter")
+                c.setdefault("system_propmt", DEFAULT_AI_FILTER_PROMPT)
                 if args.ai_filter_system_prompt:
                     c["system_prompt"] = args.ai_filter_system_prompt
                 self.vacancy_filter_ai = tool.get_ai_client(**c)
@@ -832,208 +798,7 @@ class Operation(BaseOperation):
             tool.config.get("apply_mail_body") or DEFAULT_APPLY_MAIL_BODY
         )
 
-        # Ошибки в шаблонах должны вскрыться до начала рассылки
-        self._validate_templates()
-
         self._apply_vacancies()
-
-    def _get_full_resume(self, resume_id: str) -> dict:
-        return self.api_client.get(f"/resumes/{resume_id}")
-
-    def _load_user_context(self, context_dir: Path | None) -> str:
-        """Загружает пользовательский контекст из всех *.md файлов директории.
-
-        Содержимое файлов объединяется в один блок, который затем добавляется
-        в системный промпт AI-клиента для персонализации ответов.
-        """
-        if not context_dir:
-            return ""
-        if not context_dir.is_dir():
-            logger.warning(
-                "Директория контекста не найдена: %s", context_dir
-            )
-            return ""
-
-        parts = []
-        for md_file in sorted(context_dir.glob("*.md")):
-            try:
-                content = md_file.read_text(encoding="utf-8").strip()
-            except OSError as ex:
-                logger.warning(
-                    "Не удалось прочитать файл контекста %s: %s",
-                    md_file,
-                    ex,
-                )
-                continue
-            if content:
-                parts.append(f"--- {md_file.name} ---\n{content}")
-                logger.debug(
-                    "Загружен файл контекста: %s (%d символов)",
-                    md_file.name,
-                    len(content),
-                )
-
-        context = "\n\n".join(parts)
-        if context:
-            logger.info(
-                "Загружен пользовательский контекст из %d файлов (%d символов)",
-                len(parts),
-                len(context),
-            )
-        return context
-
-    def _analyze_resume_heavy(self, resume: dict) -> str:
-        resume_id = resume.get("id")
-        cache_key = (resume_id, "heavy")
-        if cache_key in self._resume_analysis_cache:
-            return self._resume_analysis_cache[cache_key]
-
-        if resume_id:
-            try:
-                full_resume = self._get_full_resume(resume_id)
-
-                parts = []
-
-                title = full_resume.get("title", "")
-                if title:
-                    parts.append(f"Должность: {title}")
-
-                if "skills" in full_resume:
-                    parts.append("\n---------- О СЕБЕ ----------")
-                    parts.append(full_resume.get("skills", ""))
-
-                if "skill_set" in full_resume and full_resume["skill_set"]:
-                    parts.append("\n---------- НАВЫКИ ----------")
-                    skills_row = ", ".join(full_resume["skill_set"])
-                    parts.append(skills_row)
-
-                if "experience" in full_resume:
-                    parts.append("\n---------- ОПЫТ РАБОТЫ ----------")
-                    for exp in full_resume.get("experience", []):
-                        company = exp.get("company", "Не указано")
-                        position = exp.get("position", "Не указано")
-                        start = exp.get("start", "")
-                        end = exp.get("end") or "по настоящее время"
-
-                        parts.append(f"\n- {company}")
-                        parts.append(f" Должность: {position}")
-                        parts.append(f" Период: {start} - {end}")
-
-                        description = exp.get("description")
-                        if description:
-                            parts.append(" Описание:")
-                            parts.append(f" {description}")
-
-                result = "\n".join(parts)
-                self._resume_analysis_cache[cache_key] = result
-                return result
-
-            except Exception as e:
-                logger.warning(f"Не удалось получить полное резюме: {e}")
-
-        return ""
-
-    def _analyze_resume_light(self, resume: dict) -> str:
-        resume_id = resume.get("id")
-        cache_key = (resume_id, "light")
-        if cache_key in self._resume_analysis_cache:
-            return self._resume_analysis_cache[cache_key]
-
-        parts = []
-
-        full_resume = self._get_full_resume(resume_id)
-
-        title = full_resume.get("title", "")
-        if title:
-            parts.append(f"Должность: {title}")
-
-        if "skill_set" in full_resume and full_resume["skill_set"]:
-            parts.append("Навыки: ")
-            skills_row = ", ".join(full_resume["skill_set"])
-            parts.append(skills_row)
-
-        result = "\n".join(parts)
-        self._resume_analysis_cache[cache_key] = result
-        return result
-
-    def _get_vacancy_key_skills(self, vacancy_id: str | int) -> str:
-        try:
-            full_vacancy = self.api_client.get(f"/vacancies/{vacancy_id}")
-            key_skills_data = full_vacancy.get("key_skills") or []
-            return ", ".join(
-                s["name"] for s in key_skills_data if s.get("name")
-            )
-        except Exception as e:
-            logger.warning(
-                "Не удалось получить key_skills вакансии %s: %s", vacancy_id, e
-            )
-            return ""
-    
-    def _render_template(
-        self,
-        template: str,
-        placeholders: dict[str, str],
-        name: str,
-        *,
-        randomize: bool = False,
-        unescape: bool = False,
-    ) -> str:
-        """Рендерит шаблон. Любая ошибка в нем прекращает операцию."""
-        try:
-            if randomize:
-                template = rand_text(template)
-            if unescape:
-                template = unescape_string(template)
-            return render_template(template, placeholders, name)
-        except Exception as ex:
-            raise OperationError(f"Ошибка в шаблоне {name}: {ex}") from ex
-
-    def _render_cover_letter(self, placeholders: dict[str, str]) -> str:
-        return self._render_template(
-            self.cover_letter,
-            placeholders,
-            "сопроводительного письма",
-            randomize=True,
-        )
-
-    def _render_mail(self, placeholders: dict[str, str]) -> tuple[str, str]:
-        subject = self._render_template(
-            self.apply_mail_subject,
-            placeholders,
-            "apply_mail_subject",
-            randomize=True,
-        )
-        body = self._render_template(
-            self.apply_mail_body,
-            placeholders,
-            "apply_mail_body",
-            randomize=True,
-            unescape=True,
-        )
-        return subject, body
-
-    def _validate_templates(self) -> None:
-        """Пробный рендер всех используемых шаблонов до начала рассылки."""
-        base = dict.fromkeys(BASE_PLACEHOLDERS, "")
-
-        if self.cover_letter_ai:
-            self._render_template(
-                self.cover_letter_prompt,
-                base,
-                "промпта сопроводительного письма",
-            )
-        else:
-            self._render_cover_letter(base)
-
-        if self.ai_filter:
-            self._render_template(
-                self.ai_filter_prompt,
-                dict.fromkeys(AI_FILTER_PLACEHOLDERS, ""),
-                "промпта AI-фильтра",
-            )
-
-        if self.send_email:
-            self._render_mail(base)
 
     def _get_resume_info(self, resume_id: str | None) -> dict[str, str]:
         """Данные резюме для подстановки в шаблон промпта AI-фильтра."""
@@ -1099,7 +864,7 @@ class Operation(BaseOperation):
             if s.get("name")
         )
 
-        prompt = self._render_template(
+        prompt = render_template(
             self.ai_filter_prompt,
             {
                 **placeholders,
@@ -1390,7 +1155,7 @@ class Operation(BaseOperation):
 
                 if self.force_letter or vacancy.get("response_letter_required"):
                     if self.cover_letter_ai:
-                        prompt = self._render_template(
+                        prompt = render_template(
                             self.cover_letter_prompt,
                             message_placeholders,
                             "промпта сопроводительного письма",
@@ -1398,7 +1163,11 @@ class Operation(BaseOperation):
                         logger.debug("prompt: %s", prompt)
                         letter = self.cover_letter_ai.complete(prompt)
                     else:
-                        letter = self._render_cover_letter(message_placeholders)
+                        letter = render_template(
+                            rand_text(self.cover_letter),
+                            message_placeholders,
+                            "сопроводительного письма",
+                        )
 
                     logger.debug(letter)
 
@@ -1506,9 +1275,15 @@ class Operation(BaseOperation):
                             if isinstance(mail_to, list)
                             else mail_to
                         )
-                        # Ошибка в шаблонах письма обрывает рассылку
-                        mail_subject, mail_body = self._render_mail(
-                            message_placeholders
+                        mail_subject = render_template(
+                            rand_text(self.apply_mail_subject),
+                            message_placeholders,
+                            "apply_mail_subject",
+                        )
+                        mail_body = render_template(
+                            rand_text(self.apply_mail_body),
+                            message_placeholders,
+                            "apply_mail_body",
                         )
                         try:
                             self._send_email(mail_to, mail_subject, mail_body)
