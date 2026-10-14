@@ -35,6 +35,10 @@ class Config(dict, ABC):
         self.load()
 
     @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
     def file_name(self) -> Path:
         return str(self._path)
 
@@ -65,8 +69,6 @@ class Config(dict, ABC):
 
     def unlink(self) -> None:
         self._path.unlink(missing_ok=True)
-
-    __getitem__ = dict.get
 
     def __str__(self) -> str:
         return str(self._path)

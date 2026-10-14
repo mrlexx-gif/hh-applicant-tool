@@ -99,3 +99,4 @@ out/
 jadx_out/
 hars/
 captcha.md
+*.json

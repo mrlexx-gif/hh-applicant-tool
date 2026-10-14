@@ -13,6 +13,7 @@ from threading import Lock
 import requests
 from urllib3.util import Timeout
 
+from ..utils.common import get_proxies_dict
 from .base import AIError
 
 DEFAULT_DELAY = 0.5
@@ -109,9 +110,7 @@ def _foreign_letters(text: str, script: str) -> list[str]:
 @dataclass
 class ChatOpenAI:
     api_key: str
-
     _: KW_ONLY
-
     base_url: str
     system_prompt: str | None = None
     # Базовая история диалога, которая подставляется в каждый запрос
@@ -132,6 +131,8 @@ class ChatOpenAI:
     # Минимальный интервал между запросами (сек). Если с прошлого запроса
     # прошло больше — не ждём.
     delay: float | None = None
+
+    proxy_url: str | None = None
 
     session: requests.Session = field(default_factory=requests.Session)
 
@@ -158,6 +159,7 @@ class ChatOpenAI:
         """
         timeout = Timeout(connect=self.connect_timeout, total=self.timeout)
         headers = self._default_headers()
+        proxies = get_proxies_dict(self.proxy_url)
 
         with self._lock:
             if self._previous_request_time > 0:
@@ -174,6 +176,7 @@ class ChatOpenAI:
                     json=payload,
                     headers=headers,
                     timeout=timeout,
+                    proxies=proxies,
                 )
             finally:
                 self._previous_request_time = time.monotonic()

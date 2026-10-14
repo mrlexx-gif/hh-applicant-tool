@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import platform
 import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..tool import BaseNamespace, BaseOperation
@@ -130,7 +130,7 @@ class Operation(BaseOperation):
                 print(value)
             return
 
-        config_path = config.file_name
+        config_path = config.path
         if args.show_path:
             print(config_path)
             return
@@ -141,7 +141,7 @@ class Operation(BaseOperation):
             return
 
         # Default action: show content
-        print(json.dumps(config, indent=2, ensure_ascii=False))
+        print(config_path.read_text(encoding="utf-8"))
 
     @staticmethod
     def _ensure_config_file(config) -> None:
@@ -150,13 +150,13 @@ class Operation(BaseOperation):
         Без этого `config -e` падает на os.startfile с WinError 2, когда
         настройки лежат в устаревшем config.json.
         """
-        path = config._config_path
+        path = config.path
         if path.exists():
             return
         config.save()
         logger.info("Создан файл конфигурации: %s", path)
 
-    def _open_editor(self, filepath: str) -> None:
+    def _open_editor(self, filepath: Path) -> None:
         """Открывает файл в редакторе по умолчанию в зависимости от ОС."""
         match platform.system():
             case "Windows":

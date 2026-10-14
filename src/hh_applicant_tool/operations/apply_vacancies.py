@@ -30,7 +30,6 @@ from ..constants import HH_BASE_URL
 from ..errors import OperationError
 from ..storage.repositories.errors import RepositoryError
 from ..tool import BaseNamespace, BaseOperation
-from ..utils.common import find_key
 from ..utils.datatypes import VacancyTestsData
 from ..utils.string import (
     bool2str,
@@ -83,7 +82,7 @@ DEFAULT_PER_PAGE = 100
 
 DEFAULT_COVER_LETTER = """\
 {Здравствуйте|Добрый день}, меня зовут %(first_name)s.\
- {Прошу|Предлагаю} рассмотреть {мою кандидатуру|мое резюме «%(resume_title)s} на вакансию «%(vacancy_name)s».\
+ {Прошу|Предлагаю} рассмотреть {мою кандидатуру|мое резюме «%(resume_title)s»} на вакансию «%(vacancy_name)s».\
  С уважением, %(first_name)s."""
 
 
@@ -300,7 +299,7 @@ class Operation(BaseOperation):
         )
         parser.add_argument(
             "--skip-tests",
-            help="Пропускать тесты при откликах вместо",
+            help="Пропускать тесты при откликах вместо их решения",
             action=argparse.BooleanOptionalAction,
         )
         parser.add_argument(
@@ -327,8 +326,9 @@ class Operation(BaseOperation):
         )
 
         api_search_filters.add_argument(
-            "--text",
+            "-s",
             "--search",
+            dest="text",
             help="Строка поиска для фильтрации вакансий. Если указана, то поиск будет производиться по вакансиям. В остальных случаях отклики будут производиться по списку рекомендованных вакансий.",  # noqa: E501
             type=str,
         )
@@ -747,7 +747,7 @@ class Operation(BaseOperation):
         # Когда API отвечает 403 captcha_required, BaseClient зовёт этот
         # обработчик и повторяет исходный запрос.
         tool.api_client.captcha_handler = self._api_captcha_handler
-        config = tool.config
+        config = tool.general_config
         self.cover_letter = args.cover_letter or config.get(
             "cover_letter", DEFAULT_COVER_LETTER
         )
@@ -800,6 +800,7 @@ class Operation(BaseOperation):
             c.setdefault("temperature", 0.8)
             if args.cover_letter_system_prompt:
                 c["system_prompt"] = args.cover_letter_system_prompt
+            logger.debug("cover letter config: %r", c)
             if self._user_context:
                 c["system_prompt"] = (
                     c["system_prompt"]
@@ -820,13 +821,21 @@ class Operation(BaseOperation):
                 )
                 if args.ai_filter_system_prompt:
                     c["system_prompt"] = args.ai_filter_system_prompt
+                if self._user_context:
+                    c["system_prompt"] = (
+                        c["system_prompt"]
+                        + "\n\nИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ "
+                        "(обязательно используй эти данные при оценке "
+                        "соответствия вакансии):\n"
+                        + self._user_context
+                    )
                 self.vacancy_filter_ai = tool.get_ai_client(**c)
 
-        self.apply_mail_subject = (
-            tool.config.get("apply_mail_subject") or DEFAULT_APPLY_MAIL_SUBJECT
+        self.apply_mail_subject = config.get(
+            "apply_mail_subject", DEFAULT_APPLY_MAIL_SUBJECT
         )
-        self.apply_mail_body = (
-            tool.config.get("apply_mail_body") or DEFAULT_APPLY_MAIL_BODY
+        self.apply_mail_body = config.get(
+            "apply_mail_body", DEFAULT_APPLY_MAIL_BODY
         )
 
         self._apply_vacancies()
@@ -1172,6 +1181,9 @@ class Operation(BaseOperation):
                         f"/employers/{employer_id}"
                     )
 
+                    # Какая блядь эту строку стерла?
+                    seen_employers.add(employer_id)
+
                     try:
                         storage.employers.save(employer_profile)
                     except RepositoryError as ex:
@@ -1343,14 +1355,17 @@ class Operation(BaseOperation):
                             else mail_to
                         )
                         mail_subject = render_template(
-                            rand_text(self.apply_mail_subject),
+                            self.apply_mail_subject,
                             message_placeholders,
                             "apply_mail_subject",
+                            randomize_text=True,
                         )
                         mail_body = render_template(
-                            rand_text(self.apply_mail_body),
+                            self.apply_mail_body,
                             message_placeholders,
                             "apply_mail_body",
+                            randomize_text=True,
+                            escape_html=True,
                         )
                         try:
                             self._send_email(mail_to, mail_subject, mail_body)
@@ -1399,13 +1414,13 @@ class Operation(BaseOperation):
         msg["Subject"] = subject
         msg["From"] = cfg.get("from") or cfg.get("user")
         msg["To"] = to
-        msg.set_content(body)
+        msg.set_content(body, subtype="html")
         self.tool.smtp.send_message(msg)
 
     def _get_vacancy_tests(self, response_url: str) -> VacancyTestsData | None:
         """Парсит тесты"""
         res = self.tool.get_initial_state(response_url)
-        return find_key(res, "vacancyTests")
+        return res.get("vacancyTests")
 
     def _solve_vacancy_test(
         self,
@@ -1414,7 +1429,7 @@ class Operation(BaseOperation):
         letter: str = "",
     ) -> dict[str, Any]:
         """Загружает тест, ждет паузу и отправляет отклик."""
-        response_url = f"https://hh.ru/applicant/vacancy_response?vacancyId={vacancy_id}&startedWithQuestion=false&hhtmFrom=vacancy"
+        response_url = f"{self.tool.base_url}/applicant/vacancy_response?vacancyId={vacancy_id}&startedWithQuestion=false&hhtmFrom=vacancy"
 
         if not (tests_data := self._get_vacancy_tests(response_url)):
             raise ValueError(f"Данные тестов не найдены на {response_url}.")
@@ -1495,7 +1510,7 @@ class Operation(BaseOperation):
                         "{{Простите|Извините}, но я не перехожу по {внешним|сторонним} ссылкам, так как {опасаюсь взлома|не хочу {быть взломанным|подхватить вирус|чтобы у меня {со|с банковского} счета украли деньги}}.|У меня нет времени на заполнение анкет и гуглодоков}"
                     )
                 elif self.cover_letter_ai:
-                    prompt = f"Дай краткий и профессиональный ответ на вопрос: {question}"
+                    prompt = f"Ответь на вопрос: {question}"
                     # ВАЛИДАЦИЯ: проверяем, содержит ли промпт контекст пользователя
                     user_context = getattr(self, "_user_context", "") or ""
                     logger.debug(
@@ -1760,67 +1775,54 @@ class Operation(BaseOperation):
             )
         )
 
-        logger.debug(vacancy_summary)
+        logger.debug("vacancy summary: %s", vacancy_summary)
 
         if self.excluded_pat.search(vacancy_summary):
             return True
 
-        # Грузим полный текст вакансии только, если предыдущий фильтр не сработал
-        state = self.tool.get_initial_state(
-            "https://hh.ru/vacancy/" + vacancy["id"]
-        )
-        description = find_key(state, "description")
-        if not description:
-            logger.warning(
-                "Не удалось найти описание вакансии на странице: %s",
-                vacancy["alternate_url"],
-            )
-            return False
-
-        description = strip_tags(description)
-        logger.debug(description[:2047])
+        # Когда мы грузим страницу через API, то можем перехватить капчу, а на
+        # самом сайте нет
+        res = self.api_client.get(f"/vacancies/{vacancy['id']}")
+        description = res["description"]
+        logger.debug("vacancy description: %.255s", description)
         return bool(self.excluded_pat.search(description))
 
     def _is_vacancy_already_skipped(
         self, vacancy: SearchVacancy, resume_id: str | None = None
     ) -> bool:
-        try:
-            vacancy_id = vacancy["id"]
+        vacancy_id = vacancy["id"]
 
-            if resume_id:
-                if any(
-                    self.tool.storage.skipped_vacancies.find(
-                        resume_id=resume_id,
-                        vacancy_id=vacancy_id,
-                    )
-                ):
-                    return True
-
-            return any(
+        if resume_id:
+            if any(
                 self.tool.storage.skipped_vacancies.find(
-                    resume_id="",
+                    resume_id=resume_id,
                     vacancy_id=vacancy_id,
                 )
-            )
+            ):
+                return True
 
-        except Exception:
-            return False
+        return any(
+            self.tool.storage.skipped_vacancies.find(
+                resume_id="",
+                vacancy_id=vacancy_id,
+            )
+        )
 
     def _save_skipped_vacancy(
-        self, vacancy: SearchVacancy, reason: str, resume_id: str | None = None
+        self,
+        vacancy: SearchVacancy,
+        reason: str,
+        resume_id: str | None = None,
     ) -> None:
-        try:
-            employer = vacancy.get("employer", {})
-            self.tool.storage.skipped_vacancies.save(
-                {
-                    "resume_id": resume_id or "",
-                    "vacancy_id": vacancy["id"],
-                    "reason": reason,
-                    "alternate_url": vacancy.get("alternate_url"),
-                    "name": vacancy.get("name"),
-                    "employer_name": employer.get("name"),
-                    "created_at": datetime.now(),
-                }
-            )
-        except Exception as ex:
-            logger.warning(f"Не удалось сохранить пропущенную вакансию: {ex}")
+        employer = vacancy.get("employer", {})
+        self.tool.storage.skipped_vacancies.save(
+            {
+                "resume_id": resume_id or "",
+                "vacancy_id": vacancy["id"],
+                "reason": reason,
+                "alternate_url": vacancy.get("alternate_url"),
+                "name": vacancy.get("name"),
+                "employer_name": employer.get("name"),
+                "created_at": datetime.now(),
+            }
+        )

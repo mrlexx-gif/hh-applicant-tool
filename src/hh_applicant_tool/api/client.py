@@ -11,6 +11,7 @@ from urllib.parse import urlencode, urljoin
 
 import requests
 
+from ..utils.common import get_proxies_dict
 from . import errors
 from .client_keys import (
     ANDROID_CLIENT_ID,
@@ -24,7 +25,7 @@ __all__ = ("ApiClient", "OAuthClient")
 HH_API_URL = "https://api.hh.ru"
 HH_OAUTH_URL = "https://hh.ru/oauth/"
 DEFAULT_DELAY = 0.345
-DEFAULT_CAPTCHA_COOLDOWN = 3.0
+DEFAULT_CAPTCHA_COOLDOWN = 5.0
 MAX_RETRIES = 3
 MAX_CAPTCHA_RETRIES = 5
 
@@ -53,6 +54,7 @@ class BaseClient:
     max_retries: int | None = None
     session: requests.Session | None = None
     user_agent: str | None = None
+    proxy_url: str | None = None
 
     _previous_request_time: float = field(default=0.0, init=False)
     _lock: Lock = field(
@@ -67,17 +69,14 @@ class BaseClient:
         logger.debug(f"{class_name} User-Agent: {self.user_agent}")
 
         if not self.session:
-            logger.debug(f"Сreate new session for {class_name}")
+            logger.debug(f"create new session for {class_name}")
             self.session = requests.session()
-
-    @property
-    def proxies(self):
-        return self.session.proxies
 
     def _default_headers(self) -> dict[str, str]:
         return {
             "Accept": "application/json",
             "User-Agent": self.user_agent,
+            "X-Force-App-Access": "true",  # Из исходников офиц приложения
             "X-HH-App-Active": "true",
         }
 
@@ -123,7 +122,7 @@ class BaseClient:
             with self._lock:
                 self._wait_for_delay(delay)
                 logger.debug(
-                    f"({attempt}/{self.max_retries}) {method} {url} {params!r}",
+                    f"({attempt}/{self.max_retries}) {method} {url} | {payload=}",
                 )
                 try:
                     # Заголовки собираются на каждой попытке, чтобы
@@ -132,6 +131,7 @@ class BaseClient:
                         method,
                         url,
                         headers=self._default_headers(),
+                        proxies=get_proxies_dict(self.proxy_url),
                         allow_redirects=False,
                         **payload,
                     )
@@ -311,6 +311,7 @@ class ApiClient(BaseClient):
             client_id=self.client_id,
             client_secret=self.client_secret,
             user_agent=self.user_agent,
+            proxy_url=self.proxy_url,
             session=self.session,
         )
 
@@ -320,6 +321,8 @@ class ApiClient(BaseClient):
         headers = super()._default_headers()
         if not self.access_token:
             return headers
+        # Чит на бессмертие
+        # headers.update({"X-Force-App-Access": "true"})
         # Это очень интересно, что access token'ы начинаются с USER, т.е. API может содержать какую-то уязвимость, связанную с этим
         assert self.access_token.startswith("USER")
         return headers | {"Authorization": f"Bearer {self.access_token}"}
@@ -331,9 +334,12 @@ class ApiClient(BaseClient):
         params=None,
         delay=None,
         as_json=False,
+        *,
+        captcha_cooldown=None,
         max_captcha_attempts=None,
         **kwargs,
     ):
+        captcha_cooldown = captcha_cooldown or self.captcha_cooldown
         max_captcha_attempts = max_captcha_attempts or self.max_captcha_attempts
         refreshed = False
         while True:
@@ -346,43 +352,48 @@ class ApiClient(BaseClient):
                     as_json=as_json,
                     **kwargs,
                 )
+            # Глобальный перехват ошибок капчи
             except errors.CaptchaRequired as ex:
                 if not self.captcha_handler:
                     raise
-                # Только один поток должен обрабатывать капчу одновременно
+                # Одновременно капчу несколько потоков решать не должны
                 with self._captcha_lock:
-                    for attempt in range(1, max_captcha_attempts + 1):
+                    attempts = max_captcha_attempts
+                    while attempts:
                         logger.debug(
-                            f"({attempt}/{max_captcha_attempts}) handle captcha: {ex.captcha_url}"
+                            f"({max_captcha_attempts - attempts + 1}/{max_captcha_attempts}) handle captcha: {ex.captcha_url}"
                         )
                         accepted = self.captcha_handler(ex.captcha_url)
                         if accepted:
                             logger.info("captcha accepted!")
                             break
+                        attempts -= 1
                     if accepted:
-                        logger.debug(
-                            f"captcha cooldown: {self.captcha_cooldown}"
-                        )
-                        time.sleep(self.captcha_cooldown)
+                        logger.debug(f"captcha cooldown: {captcha_cooldown}")
+                        time.sleep(captcha_cooldown)
                         continue
                 raise
             except errors.Forbidden:
                 if (
-                    refreshed 
-                    or not self.refresh_token 
+                    refreshed
+                    or not self.refresh_token
                     or not self.is_access_expired
                 ):
                     raise
                 with self._refresh_lock:
-                    # try:
-                    self.refresh_access_token()
+                    # Тоже может в свою очередь кинуть 400 или 403, если refresh_token недействителен
+                    try:
+                        self.refresh_access_token()
+                    # Ошибка слишком общая
+                    except errors.ApiError:
+                        self.reset_tokens()
+                        raise
                     refreshed = True
-                    # except errors.Forbidden:
-                    #     # Refresh токен недействителен
-                    #     self.access_token = None
-                    #     self.refresh_token = None
-                    #     self.access_expires_at = 0
-                    #     raise
+
+    def reset_tokens(self) -> None:
+        self.access_token = None
+        self.refresh_token = None
+        self.access_expires_at = 0
 
     def handle_access_token(self, token: AccessToken) -> None:
         for name in ("access_token", "refresh_token", "access_expires_at"):
