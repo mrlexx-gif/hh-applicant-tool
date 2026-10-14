@@ -14,7 +14,7 @@ from copy import deepcopy
 from dataclasses import KW_ONLY, dataclass
 from datetime import datetime, timedelta
 from functools import cached_property
-from http.cookiejar import MozillaCookieJar
+from http.cookiejar import LoadError, MozillaCookieJar
 from importlib import import_module
 from itertools import count
 from os import getenv
@@ -295,9 +295,24 @@ class HHApplicantTool:
         session = self._create_session()
 
         if self.cookies_file.exists():
-            jar = MozillaCookieJar(str(self.cookies_file))
-            jar.load(ignore_discard=True, ignore_expires=True)
-            session.cookies.update(jar)
+            if self.cookies_file.stat().st_size == 0:
+                logger.warning(
+                    "Файл cookies пуст (%s), удаляю.", self.cookies_file
+                )
+                self.cookies_file.unlink(missing_ok=True)
+            else:
+                jar = MozillaCookieJar(str(self.cookies_file))
+                try:
+                    jar.load(ignore_discard=True, ignore_expires=True)
+                except (LoadError, OSError) as ex:
+                    logger.warning(
+                        "Не удалось прочитать cookies из %s: %s. "
+                        "Файл будет проигнорирован.",
+                        self.cookies_file,
+                        ex,
+                    )
+                else:
+                    session.cookies.update(jar)
 
         # Запоминаем куки, которые были при инициализации
         self._original_cookies = list(session.cookies)
