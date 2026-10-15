@@ -7,12 +7,10 @@ import json
 import logging
 import re
 import smtplib
-import sqlite3
 import sys
 from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import KW_ONLY, dataclass
-from datetime import datetime, timedelta
 from functools import cached_property
 from http.cookiejar import MozillaCookieJar
 from importlib import import_module
@@ -25,16 +23,19 @@ from urllib.parse import parse_qs, quote, urljoin, urlsplit
 
 import requests
 
-from . import ai, api, utils
+from hh_applicant_tool.utils.package import PACKAGE_NAME
+
+from . import ai, api
 from .constants import (
     ACCEPT_LANGUAGE,
+    ANDROID_CLIENT_ID,
+    ANDROID_CLIENT_SECRET,
     ANDROID_WEBVIEW_USERAGENT,
     AUTH_CONFIG_FILENAME,
     CAPTCHA_SUCCESS_BACKURL,
     CONFIG_DIR,
     CONFIG_FILENAME,
     COOKIES_FILENAME,
-    DATABASE_FILENAME,
     DEFAULT_CAPTCHA_LANGUAGE,
     DEFAULT_DESKTOP_USERAGENT,
     HH_BASE_URL,
@@ -42,13 +43,13 @@ from .constants import (
     REPO_URL,
 )
 from .errors import Error, OperationCanceled, OperationError
-from .storage import StorageFacade
 from .utils.argparse import ArgumentFormatter
 from .utils.config import ConfigJSON, ConfigTOML
+from .utils.helpers import get_proxies_dict
 from .utils.log import setup_logger
-from .utils.package import PACKAGE_NAME, get_package_version, parse_version
-from .utils.system import is_docker, has_gui_support
-from .utils.terminal import print_kitty_image, print_sixel_image
+from .utils.system import has_gui_support, is_docker
+from .utils.term import print_kitty_image, print_sixel_image, setup_terminal
+from .utils.user_agent import generate_android_useragent
 
 logger = logging.getLogger("hh-applicant-tool")
 
@@ -114,6 +115,7 @@ class HHApplicantTool:
     _: KW_ONLY
     api_delay: float | None = None
     base_url: str | None = None
+    captcha_manual: bool = False
     captcha_lang: str | None = None
     config_dir: Path | None = None
     openai_connect_timeout: float | None = None
@@ -225,6 +227,13 @@ class HHApplicantTool:
             choices=["RU", "EN"],
             help="Язык капчи. Некоторые модели распознают лучше текст на английском",
         )
+        parser.add_argument(
+            "--captcha-manual",
+            "--manual",
+            help="Ручной ввод капчи. Полезен, если модель не поддерживает vision",
+            action="store_true",
+            default=False,
+        )
         subparsers = parser.add_subparsers(help="commands")
         package_dir = Path(__file__).resolve().parent / OPERATIONS
         for _, module_name, _ in iter_modules([str(package_dir)]):
@@ -247,52 +256,22 @@ class HHApplicantTool:
     def __post_init__(self) -> None:
         self._parser = self._create_parser()
 
+        config = self.general_config
+
         # Эти значения, если они не установлены, берутся из конфига и могут быть
         # изменены флагами
-        self.user_agent = self.user_agent or self.config.get(
+        self.user_agent = self.user_agent or config.get(
             "user_agent", DEFAULT_DESKTOP_USERAGENT
         )
-        self.base_url = self.base_url or self.config.get(
-            "base_url", HH_BASE_URL
-        )
-        self.captcha_lang = self.captcha_lang or self.config.get(
+        self.base_url = self.base_url or config.get("base_url", HH_BASE_URL)
+        self.captcha_lang = self.captcha_lang or config.get(
             "captcha_lang", DEFAULT_CAPTCHA_LANGUAGE
         )
 
-    @staticmethod
-    def _proxy_url_to_dict(proxy_url: str | None) -> dict[str, str]:
-        if not proxy_url:
-            return {}
-
-        return {
-            "http": proxy_url,
-            "https": proxy_url,
-        }
-
-    def _get_proxies(self) -> dict[str, str]:
-        proxy_url = self.proxy_url or self.config.get("proxy_url")
-
-        if proxy_url:
-            return self._proxy_url_to_dict(proxy_url)
-
-        proxies = {}
-        http_env = getenv("HTTP_PROXY") or getenv("http_proxy")
-        https_env = getenv("HTTPS_PROXY") or getenv("https_proxy") or http_env
-
-        if http_env:
-            proxies["http"] = http_env
-        if https_env:
-            proxies["https"] = https_env
-
-        return proxies
-
-    def _get_openai_proxies(self, section: str = None) -> dict[str, str]:
-        openai_config = self.get_openai_config(section=section)
-        proxy_url = self.openai_proxy_url or openai_config.get("proxy_url")
-        if proxy_url:
-            return self._proxy_url_to_dict(proxy_url)
-        # Из какого-нибудь казахстана одинаково hh и ChatGPT работают
-        return self._get_proxies()
+    @property
+    def general_config(self) -> dict[str, Any]:
+        self.config.setdefault("general", {})
+        return self.config["general"]
 
     def _create_session(
         self,
@@ -300,9 +279,11 @@ class HHApplicantTool:
         proxies: dict[str, str] | None = None,
     ) -> requests.Session:
         session = requests.Session()
+        if proxies is None:
+            proxies = get_proxies_dict(self.proxy_url)
 
         if proxies:
-            logger.info("Use proxies for Browser: %r", proxies)
+            logger.debug("session proxies: %r", proxies)
             session.proxies = proxies
 
         # В заголовки не лезь, если не понимаешь зачем они
@@ -314,37 +295,32 @@ class HHApplicantTool:
             }
         )
 
-        logger.debug("Desktop Session Headers: %r", session.headers)
+        logger.debug("session headers: %r", session.headers)
 
         return session
 
     @cached_property
     def session(self) -> requests.Session:
-        session = self._create_session(
-            proxies=self._get_proxies(),
-        )
+        session = self._create_session()
 
         if self.cookies_file.exists():
             jar = MozillaCookieJar(str(self.cookies_file))
             jar.load(ignore_discard=True, ignore_expires=True)
             session.cookies.update(jar)
 
+        # Запоминаем куки, которые были при инициализации
+        self._original_cookies = list(session.cookies)
         return session
 
-    @staticmethod
-    def get_tool_useragent() -> str:
-        return f"{PACKAGE_NAME}/{get_package_version()} (+{REPO_URL})"
-
-    def get_openai_session(self) -> requests.Session:
-        session = requests.session()
-
-        if proxies := self._get_openai_proxies():
-            session.proxies = proxies
-
-        session.headers.update({"User-Agent": self.get_tool_useragent()})
-
-        logger.debug("OpenAI Session Headers: %r", session.headers)
-
+    @cached_property
+    def ai_session(self) -> requests.Session:
+        session = requests.Session()
+        session.headers.update(
+            {
+                "User-Agent": f"{PACKAGE_NAME} (+{REPO_URL})",
+            }
+        )
+        logger.debug("AI Default Headers: %r", session.headers)
         return session
 
     @cached_property
@@ -369,19 +345,6 @@ class HHApplicantTool:
     @cached_property
     def cookies_file(self) -> Path:
         return self.config_dir_path / COOKIES_FILENAME
-
-    @cached_property
-    def db_path(self) -> Path:
-        return self.config_dir_path / DATABASE_FILENAME
-
-    @cached_property
-    def db(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        return conn
-
-    @cached_property
-    def storage(self) -> StorageFacade:
-        return StorageFacade(self.db)
 
     # def get_section_config(self, section: str) -> dict:
     #     keys = section.split(".")
@@ -410,26 +373,32 @@ class HHApplicantTool:
 
     @cached_property
     def api_client(self) -> api.client.ApiClient:
-        # Раньше токен хранился в общем конфиге, но так как при сохранении
-        # токена затираются комментарии, он был вынесен в отдельный файл
-        token = self.auth_config.get("token") or self.config.get("token") or {}
-        client_config = (self.config.get("api_client") or {}).copy()
-        # если передан аргумент, то он перекрывает значение из конфига
+        token = self.auth_config.get("token", self.config.get("token", {}))
+        client_config = self.config.get("api_client", {}).copy()
+        client_config.setdefault("proxy_url", self.proxy_url)
         if self.api_delay:
             client_config["delay"] = self.api_delay
-        return api.client.ApiClient(
+
+        client = api.client.ApiClient(
             access_token=token.get("access_token"),
             refresh_token=token.get("refresh_token"),
             access_expires_at=token.get("access_expires_at"),
+            client_id=ANDROID_CLIENT_ID,
+            client_secret=ANDROID_CLIENT_SECRET,
+            user_agent=generate_android_useragent(),
             captcha_handler=self.handle_captcha,
             **client_config,
         )
+        
+        self._original_token = client.get_access_token()
+        return client
 
     def get_ai_client(
         self,
         system_prompt: str | None = None,
         **kwargs,
     ) -> ai.ChatOpenAI:
+        kwargs.setdefault("session", self.ai_session)
         return ai.ChatOpenAI(system_prompt=system_prompt, **kwargs)
 
     def get_openai_config(self, section: str | None = None) -> dict:
@@ -468,7 +437,7 @@ class HHApplicantTool:
         )
 
         required("base_url")
-        required("api_key")
+        # required("api_key")
         required("model")
 
         if self.openai_delay:
@@ -487,6 +456,7 @@ class HHApplicantTool:
             for k, v in c.items()
             if k
             in [
+                "api_key",
                 "base_url",
                 "connect_timeout",
                 "delay",
@@ -494,6 +464,7 @@ class HHApplicantTool:
                 "max_completion_tokens",
                 "max_retries",
                 "model",
+                "proxy_url",
                 "system_prompt",
                 "temperature",
                 "timeout",
@@ -599,26 +570,41 @@ class HHApplicantTool:
         return self.parse_initial_state(r)
 
     def save_token(self) -> bool:
-        if self.api_client.access_token != self.auth_config.get(
-            "token", {}
-        ).get("access_token"):
-            self.auth_config.save(token=self.api_client.get_access_token())
-            return True
-        return False
+        # Методы API не вызывались
+        if not hasattr(self, "_original_token"):
+            return False
+
+        token = self.api_client.get_access_token()
+
+        # Поля токена не изменились
+        if token == self._original_token:
+            return False
+
+        self.auth_config.save(token=token)
+        self._original_token = token
+        return True
 
     def save_cookies(self) -> None:
         """Сохраняет cookies сессии hh в файл."""
-        jar = MozillaCookieJar(str(self.cookies_file))
+        if not hasattr(self, "_original_cookies"):
+            return
 
+        jar = MozillaCookieJar(str(self.cookies_file))
         for c in self.session.cookies:
             if c.domain and not re.search(
-                r"^(?!israel\.)(?:.*?\.)?hh\.(ru|kz|uz|by|net|com)\.?$",
+                r"^((?:.*?\.)?hh\.(ru|kz|uz|by|net|com)|rabota\.by)\.?$",
                 c.domain,
             ):
                 continue
-            cc = copy.copy(c)
-            jar.set_cookie(cc)
+
+            jar.set_cookie(copy.copy(c))
+
+        current_cookies = list(jar)
+        if self._original_cookies == current_cookies:
+            return
+
         jar.save(ignore_discard=True, ignore_expires=True)
+        self._original_cookies = current_cookies
         logger.debug("Cookies saved to %s", self.cookies_file)
 
     @property
@@ -632,7 +618,7 @@ class HHApplicantTool:
 
     @cached_property
     def smtp(self) -> smtplib.SMTP | smtplib.SMTP_SSL:
-        conf = self.config.get("smtp", {})
+        conf = self.general_config.get("smtp", {})
         host = conf.get("host")
         port = conf.get("port")
         user = conf.get("user")
@@ -654,7 +640,7 @@ class HHApplicantTool:
         return server
 
     def _solve_captcha(self, image_data: bytes) -> str:
-        if self.use_ai:
+        if self.use_ai and not self.captcha_manual:
             return self.captcha_ai.recognize_text(image_data)
 
         if not has_gui_support() or self.use_kitty or self.use_sixel:
@@ -777,7 +763,7 @@ class HHApplicantTool:
 
         lang = lang or self.captcha_lang
         target_url = urljoin(
-            referer_url or HH_BASE_URL, "/captcha?lang=" + quote(lang)
+            referer_url or self.base_url, "/captcha?lang=" + quote(lang)
         )
         logger.debug(
             "Отправляем POST-запрос на %s для получения captcha key",
@@ -809,6 +795,7 @@ class HHApplicantTool:
         )
         logger.debug("Пробуем загрузить капчу: %s", image_url)
 
+        # Браузер когда встречает в разметке тег IMG, посылает другой Accept
         headers = {
             "Accept": "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5"
         }
@@ -978,9 +965,12 @@ class HHApplicantTool:
                 logger.warning("session does not exist")
         try:
             self.api_client.delete("/oauth/token")
+            self.api_client.reset_tokens()
             logger.info("token revoked")
         except api.errors.Forbidden:
             logger.warning("token has expired or been revoked")
+        # Затираем куки
+        self.session.cookies.clear()
 
     @cached_property
     def captcha_ai(self) -> ai.ChatOpenAI:
@@ -1008,42 +998,7 @@ class HHApplicantTool:
             logging.DEBUG, logging.WARNING - self.verbosity * 10
         )
         setup_logger(logger, verbosity_level, self.log_file)
-        utils.setup_terminal()
-
-    def _get_latest_version(self) -> Literal[False] | str:
-        try:
-            response = self.session.get(
-                "https://pypi.org/pypi/hh-applicant-tool/json", timeout=15
-            )
-            ver = response.json().get("info", {}).get("version")
-            # logger.debug(ver)
-            return ver
-        except requests.RequestException:
-            return False
-
-    def _check_version(self) -> bool:
-        if datetime.now().timestamp() >= self.storage.settings.get_value(
-            "_next_version_check", 0
-        ):
-            if v := self._get_latest_version():
-                self.storage.settings.set_value("_latest_version", v)
-                self.storage.settings.set_value(
-                    "_next_version_check", datetime.now() + timedelta(hours=1)
-                )
-
-        if (
-            latest_ver := self.storage.settings.get_value("_latest_version")
-        ) and (cur_ver := get_package_version()):
-            if parse_version(latest_ver) > parse_version(cur_ver):
-                logger.warning(
-                    "ТЕКУЩАЯ ВЕРСИЯ %s УСТАРЕЛА. РЕКОМЕНДУЕТСЯ ОБНОВИТЬ ЕЁ ДО ВЕРСИИ %s.",
-                    cur_ver,
-                    latest_ver,
-                )
-
-    def _check_system(self):
-        if not self.storage.settings.get_value("disable_version_check", False):
-            self._check_version()
+        setup_terminal()
 
     def _assign_args(self, args: BaseNamespace) -> None:
         for k, v in vars(args).items():
@@ -1063,7 +1018,7 @@ class HHApplicantTool:
                 self._parser.print_help(file=sys.stderr)
                 return 2
             return self.operation_run(self, args)
-        except (KeyboardInterrupt, OperationCanceled):
+        except (OperationCanceled, KeyboardInterrupt, EOFError):
             logger.warning("Выполнение операции прервано!")
             return 130
         except OperationError as ex:
@@ -1081,6 +1036,5 @@ class HHApplicantTool:
                 logger.error(f"Не удалось сохранить cookies: {ex}")
 
             self._save_config_if_needed()
-            self._check_system()
 
         return 1

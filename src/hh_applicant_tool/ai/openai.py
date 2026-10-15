@@ -11,11 +11,14 @@ from threading import Lock
 import requests
 from urllib3.util import Timeout
 
+from ..utils.helpers import get_proxies_dict
 from .base import AIError
 
 DEFAULT_DELAY = 0.5
-DEFAULT_TIMEOUT = 60.0
-DEFAULT_CONNECT_TIMEOUT = 10.0
+DEFAULT_TIMEOUT = 90.0
+DEFAULT_CONNECT_TIMEOUT = 15.0
+
+CHAT_COMPLETIONS_ENDPOINT = "/chat/completions"
 
 
 logger = logging.getLogger("hh-applicant-tool")
@@ -27,11 +30,10 @@ class OpenAIError(AIError):
 
 @dataclass
 class ChatOpenAI:
-    api_key: str
-
-    _: KW_ONLY
-
     base_url: str
+    model: str
+    _: KW_ONLY
+    api_key: str | None = None
     system_prompt: str | None = None
     # Базовая история диалога, которая подставляется в каждый запрос
     # перед history из вызова complete()/recognize_text()
@@ -46,11 +48,14 @@ class ChatOpenAI:
 
     temperature: float = 0.0
     max_completion_tokens: int = 1000
-    model: str | None = None
 
     # Минимальный интервал между запросами (сек). Если с прошлого запроса
     # прошло больше — не ждём.
     delay: float | None = None
+
+    chat_completions_endpoint: str | None = None
+
+    proxy_url: str | None = None
 
     session: requests.Session = field(default_factory=requests.Session)
 
@@ -63,11 +68,18 @@ class ChatOpenAI:
         self.delay = self.delay or DEFAULT_DELAY
         self.timeout = self.timeout or DEFAULT_TIMEOUT
         self.connect_timeout = self.connect_timeout or DEFAULT_CONNECT_TIMEOUT
+        self.chat_completions_endpoint = (
+            self.chat_completions_endpoint or CHAT_COMPLETIONS_ENDPOINT
+        )
 
     def _default_headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-        }
+        return (
+            {
+                "Authorization": f"Bearer {self.api_key}",
+            }
+            if self.api_key
+            else {}
+        )
 
     def _request(self, payload: dict) -> requests.Response:
         """Выполнение запроса с минимальным интервалом между запросами.
@@ -77,6 +89,7 @@ class ChatOpenAI:
         """
         timeout = Timeout(connect=self.connect_timeout, total=self.timeout)
         headers = self._default_headers()
+        proxies = get_proxies_dict(self.proxy_url)
 
         with self._lock:
             if self._previous_request_time > 0:
@@ -89,10 +102,11 @@ class ChatOpenAI:
 
             try:
                 return self.session.post(
-                    self.base_url,
+                    f"{self.base_url.rstrip('/')}/{self.chat_completions_endpoint.lstrip('/')}",
                     json=payload,
                     headers=headers,
                     timeout=timeout,
+                    proxies=proxies,
                 )
             finally:
                 self._previous_request_time = time.monotonic()
@@ -179,6 +193,13 @@ class ChatOpenAI:
         for attempt in range(self.max_retries + 1):
             try:
                 response = self._request(payload)
+                logger.debug(
+                    "OpenAI %s %s -> %d (%.2fs)",
+                    response.request.method,
+                    response.url,
+                    response.status_code,
+                    response.elapsed.total_seconds(),
+                )
             except requests.exceptions.RequestException as ex:
                 # Таймаут локальной модели и оборванное соединение
                 # повторяем, а не роняем отклик на первой вакансии
@@ -241,13 +262,8 @@ class ChatOpenAI:
         messages = self._build_messages(message, system_prompt, history)
 
         logger.debug(
-            "AI системный промпт: %s",
-            system_prompt if system_prompt is not None else self.system_prompt,
-        )
-        logger.debug(
-            "AI запрос: %s (сообщений в истории: %d)",
+            "AI запрос: %s",
             message,
-            len(self.history) + len(history or []),
         )
 
         return self._post_chat(
