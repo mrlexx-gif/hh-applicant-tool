@@ -5,6 +5,7 @@ import copy
 import html
 import json
 import logging
+import os
 import re
 import smtplib
 import sqlite3
@@ -296,8 +297,13 @@ class HHApplicantTool:
 
         if self.cookies_file.exists():
             if self.cookies_file.stat().st_size == 0:
+                # Пустой файл — признак прерванного сохранения. Восстановить
+                # из него нечего, поэтому убираем, но громко предупреждаем.
                 logger.warning(
-                    "Файл cookies пуст (%s), удаляю.", self.cookies_file
+                    "Файл cookies пуст (%s) — вероятно, сохранение было "
+                    "прервано. Сессия hh.ru потеряна, выполните authorize "
+                    "для повторного входа. Файл удаляю.",
+                    self.cookies_file,
                 )
                 self.cookies_file.unlink(missing_ok=True)
             else:
@@ -615,18 +621,91 @@ class HHApplicantTool:
         if self._original_cookies == current_cookies:
             return
 
-        jar.save(ignore_discard=True, ignore_expires=True)
+        # Пишем во временный файл и атомарно подменяем целевой. Прямая
+        # запись открывает файл на усечение ("w"), поэтому прерывание
+        # процесса (например, Ctrl+C) посреди сохранения оставляло пустой
+        # (0 байт) cookies.txt. На следующем запуске такой файл удалялся,
+        # сессия hh.ru терялась, и сайт редиректил на страницу входа —
+        # отклики на вакансии с тестами падали с "Данные тестов не найдены".
+        self.cookies_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = self.cookies_file.with_name(
+            self.cookies_file.name + ".tmp"
+        )
+        try:
+            jar.save(
+                str(tmp_file), ignore_discard=True, ignore_expires=True
+            )
+            os.replace(tmp_file, self.cookies_file)
+        except OSError as ex:
+            logger.error("Не удалось сохранить cookies: %s", ex)
+            tmp_file.unlink(missing_ok=True)
+            return
+
         self._original_cookies = current_cookies
         logger.debug("Cookies saved to %s", self.cookies_file)
 
     @property
     def is_logged_in(self) -> bool:
         """Проверяет авторизован ли пользователь через сайт."""
-        return self.session.get(f"{self.base_url}/settings").status_code == 200
+        r = self.session.get(f"{self.base_url}/settings")
+        # Анонимный пользователь получает редирект на страницу
+        # входа/регистрации, но итоговый статус всё равно 200.
+        if "/account/login" in r.url or "/account/signup" in r.url:
+            return False
+        return r.status_code == 200
+
+    def _cookie_value(self, name: str) -> str | None:
+        """Возвращает значение cookie по имени (любой тип CookieJar)."""
+        jar = self.session.cookies
+        getter = getattr(jar, "get", None)
+        if callable(getter):
+            value = getter(name)
+            if value:
+                return value
+        for cookie in jar:
+            if cookie.name == name:
+                return cookie.value
+        return None
+
+    def _extract_xsrf_token(self, page: str) -> str:
+        """Извлекает xsrf-токен из HTML страницы hh.ru.
+
+        На странице может быть несколько вхождений `xsrfToken`, причём
+        первое — «декоративное» и ротируется при каждой загрузке. Сервер
+        валидирует значение cookie `_xsrf`, поэтому предпочитаем вхождение,
+        равное этой cookie (иначе POST на /applicant/vacancy_response/popup
+        отдаёт 403 — CSRF mismatch).
+        """
+        text = html.unescape(page)
+        tokens = re.findall(
+            r'xsrfToken["\']?\s*[:=]\s*["\']([^"\']+)["\']', text
+        )
+        if not tokens:
+            raise ValueError("xsrf token not found on the page")
+
+        cookie_token = self._cookie_value("_xsrf")
+        if cookie_token and cookie_token in tokens:
+            return cookie_token
+        return tokens[0]
 
     @property
     def xsrf_token(self) -> str | None:
-        return self.session.cookies.get("_xsrf")
+        # Сервер валидирует именно cookie `_xsrf`, поэтому берём её, если
+        # она есть, и не дёргаем сеть.
+        if token := self._cookie_value("_xsrf"):
+            return token
+
+        # Cookie нет — достаём токен со страницы.
+        try:
+            response = self.session.get(self.base_url)
+        except requests.RequestException as ex:
+            logger.warning("Не удалось получить xsrf-токен: %s", ex)
+            return None
+        try:
+            return self._extract_xsrf_token(response.text)
+        except ValueError as ex:
+            logger.warning("%s", ex)
+            return None
 
     @cached_property
     def smtp(self) -> smtplib.SMTP | smtplib.SMTP_SSL:

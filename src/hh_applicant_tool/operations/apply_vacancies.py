@@ -27,7 +27,7 @@ from ..api.captcha import CaptchaError, CaptchaFlow
 from ..api.datatypes import PaginatedItems, SearchVacancy
 from ..api.errors import ApiError, LimitExceeded
 from ..constants import HH_BASE_URL
-from ..errors import OperationError
+from ..errors import NotAuthorizedError, OperationError
 from ..storage.repositories.errors import RepositoryError
 from ..tool import BaseNamespace, BaseOperation
 from ..utils.datatypes import VacancyTestsData
@@ -87,30 +87,33 @@ DEFAULT_COVER_LETTER = """\
 
 
 # Системные промпты - простые строки, не шаблоны
+# Пользовательские промпты - шаблоны, подстановка через %(name)s
 DEFAULT_COVER_LETTER_SYSTEM_PROMPT = (
     "Ты помогаешь соискателю писать сопроводительные письма. "
     "Пиши кратко, вежливо и по делу, не выдумывай фактов."
 )
-DEFAULT_AI_FILTER_SYSTEM_PROMPT = (
-    "Ты определяешь, подходит ли вакансия кандидату. "
-    "Отвечай одним словом: «да» или «нет»."
-)
-
-# Пользовательские промпты - шаблоны, подстановка через %(name)s
 DEFAULT_COVER_LETTER_PROMPT = (
     "Сгенерируй сопроводительное письмо не более 5-7 предложений "
     "от моего имени для вакансии «%(vacancy_name)s» "
     "работодателя «%(employer_name)s». "
     "Меня зовут %(first_name)s, мое резюме: «%(resume_title)s»."
 )
+DEFAULT_AI_FILTER_SYSTEM_PROMPT = (
+    "Ты определяешь, подходит ли вакансия кандидату. Отвечай одним словом: «да» или «нет»."
+    "Если ответ «нет» — через вертикальную черту укажи код причины: ОФОРМЛЕНИЕ, ФОРМАТ, ЗАРПЛАТА, УРОВЕНЬ, БЮДЖЕТ, ОТРАСЛЬ, ДРУГОЕ."
+    "Пример формата: нет | УРОВЕНЬ"
+)
 DEFAULT_AI_FILTER_PROMPT = """\
-Резюме кандидата:
+Вакансия: %(vacancy_name)s
+Работодатель: %(employer_name)s
+Ссылка: %(vacancy_url)s
+Ключевые навыки вакансии: %(vacancy_key_skills)s
+Описание: %(vacancy_description)s
+
+Кандидат (срез из резюме):
 Должность: %(resume_title)s
 Навыки: %(resume_skills)s
-
-Вакансия: %(vacancy_name)s
-Ключевые навыки: %(vacancy_key_skills)s
-Описание: %(vacancy_description)s
+О кандидате: %(resume_about)s
 
 Подходит ли эта вакансия кандидату?"""
 
@@ -770,6 +773,8 @@ class Operation(BaseOperation):
         self.send_email = args.send_email
         self.skip_tests = args.skip_tests
         self.total_pages = args.total_pages
+        # Кэш проверки авторизации веб-сессии (нужна для вакансий с тестами)
+        self._web_session_ok: bool | None = None
 
         # Пользовательский контекст (*.md): содержимое всех *.md файлов
         # добавляется в системный промпт AI, чтобы письма и ответы на тесты
@@ -1256,6 +1261,12 @@ class Operation(BaseOperation):
                 )
 
                 if vacancy.get("has_test"):
+                    # Тесты решаются только авторизованной веб-сессией.
+                    # Без неё hh.ru редиректит на страницу входа, и все
+                    # отклики на вакансии с тестами будут падать.
+                    if not self.dry_run and not self._can_solve_tests():
+                        continue
+
                     logger.debug(
                         "Решаем тест: %s",
                         vacancy["alternate_url"],
@@ -1312,6 +1323,12 @@ class Operation(BaseOperation):
                             # повторно отправлялся
                             continue
 
+                    except NotAuthorizedError as ex:
+                        # Не авторизованы на сайте — тесты решить нельзя,
+                        # но остальные вакансии (без теста) применятся через
+                        # API, поэтому просто пропускаем такие вакансии.
+                        logger.warning(ex)
+                        continue
                     except Exception as ex:
                         logger.error(f"Произошла непредвиденная ошибка: {ex}")
                         continue
@@ -1417,6 +1434,21 @@ class Operation(BaseOperation):
         msg.set_content(body, subtype="html")
         self.tool.smtp.send_message(msg)
 
+    def _can_solve_tests(self) -> bool:
+        """Проверяет (однократно) доступна ли веб-сессия для решения тестов."""
+        cached = getattr(self, "_web_session_ok", None)
+        if cached is None:
+            cached = bool(self.tool.is_logged_in)
+            self._web_session_ok = cached
+            if not cached:
+                logger.warning(
+                    "Нет авторизации на сайте hh.ru (cookie-сессия "
+                    "отсутствует или истекла). Вакансии с тестами будут "
+                    "пропущены. Выполните `hh-applicant-tool authorize`, "
+                    "чтобы откликаться и на них."
+                )
+        return cached
+
     def _get_vacancy_tests(self, response_url: str) -> VacancyTestsData | None:
         """Парсит тесты"""
         res = self.tool.get_initial_state(response_url)
@@ -1429,10 +1461,24 @@ class Operation(BaseOperation):
         letter: str = "",
     ) -> dict[str, Any]:
         """Загружает тест, ждет паузу и отправляет отклик."""
+        # Тесты отдаются только авторизованной веб-сессии (cookies.txt).
+        # Без неё hh.ru редиректит на страницу входа, и парсинг возвращает
+        # пустоту — раньше это выглядело как загадочное "Данные тестов
+        # не найдены".
+        if not self._can_solve_tests():
+            raise NotAuthorizedError(
+                "Нет авторизации на сайте hh.ru: cookie-сессия отсутствует "
+                "или истекла, поэтому данные теста недоступны. Выполните "
+                "`hh-applicant-tool authorize` и повторите запуск."
+            )
+
         response_url = f"{self.tool.base_url}/applicant/vacancy_response?vacancyId={vacancy_id}&startedWithQuestion=false&hhtmFrom=vacancy"
 
         if not (tests_data := self._get_vacancy_tests(response_url)):
-            raise ValueError(f"Данные тестов не найдены на {response_url}.")
+            raise ValueError(
+                f"Данные тестов не найдены на {response_url}. "
+                "Возможно, вакансия уже недоступна или тест неактуален."
+            )
 
         if not (test_data := tests_data.get(str(vacancy_id))):
             raise ValueError(
