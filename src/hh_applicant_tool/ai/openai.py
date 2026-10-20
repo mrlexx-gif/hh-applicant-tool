@@ -230,13 +230,6 @@ class ChatOpenAI:
         messages.append({"role": "user", "content": user_content})
         return messages
 
-        # Логирование запроса к AI при DEBUG уровне
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("AI системный промпт: %s", self.system_prompt)
-            logger.debug("AI запрос: %s", message)
-            # ВАЛИДАЦИЯ: показываем полный payload (system+user),
-            # чтобы проверить, какой контекст пользователя реально уходит в AI
-            logger.debug("AI полные messages (system+user): %r", messages)
     def _post_chat(
         self,
         messages: list[dict],
@@ -336,14 +329,10 @@ class ChatOpenAI:
         messages = self._build_messages(message, system_prompt, history)
 
         logger.debug(
-            "AI системный промпт: %s",
+            "AI системный промпт: %.300s",
             system_prompt if system_prompt is not None else self.system_prompt,
         )
-        logger.debug(
-            "AI запрос: %s (сообщений в истории: %d)",
-            message,
-            len(self.history) + len(history or []),
-        )
+        logger.debug("AI запрос: %.300s", message)
 
         return self._post_chat(
             messages,

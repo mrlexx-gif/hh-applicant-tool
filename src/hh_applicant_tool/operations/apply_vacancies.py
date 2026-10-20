@@ -809,9 +809,7 @@ class Operation(BaseOperation):
             if self._user_context:
                 c["system_prompt"] = (
                     c["system_prompt"]
-                    + "\n\nИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ "
-                    "(обязательно используй эти данные для персонализации "
-                    "своих ответов):\n"
+                    + "\nИНФОРМАЦИЯ О КАНДИДАТЕ \n"
                     + self._user_context
                 )
                 logger.debug(
@@ -829,9 +827,7 @@ class Operation(BaseOperation):
                 if self._user_context:
                     c["system_prompt"] = (
                         c["system_prompt"]
-                        + "\n\nИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ "
-                        "(обязательно используй эти данные при оценке "
-                        "соответствия вакансии):\n"
+                        + "\nИНФОРМАЦИЯ О КАНДИДАТЕ\n"
                         + self._user_context
                     )
                 self.vacancy_filter_ai = tool.get_ai_client(**c)
@@ -1022,18 +1018,6 @@ class Operation(BaseOperation):
             resume["title"],
         )
         print("🚀 Начинаю рассылку откликов для резюме:", resume["title"])
-        # ВАЛИДАЦИЯ captcha: видно, чем и как мы вообще собираемся её
-        # решать. Если handler=None и все *_ai/kitty/sixel=False, капчу
-        # физически нечем проходить.
-        logger.debug(
-            "ВАЛИДАЦИЯ captcha: handler=%r use_ai=%s kitty=%s sixel=%s "
-            "captcha_lang=%s",
-            getattr(self.api_client, "captcha_handler", None),
-            getattr(self.tool, "use_ai", None),
-            getattr(self.tool, "use_kitty", None),
-            getattr(self.tool, "use_sixel", None),
-            getattr(self.tool, "captcha_lang", None),
-        )
         applied_count = 0
         limit_reached = False
 
@@ -1401,15 +1385,6 @@ class Operation(BaseOperation):
                 )
                 break
             except ApiError as ex:
-                # ВАЛИДАЦИЯ captcha: 403 captcha_required прилетает сюда.
-                logger.debug(
-                    "ВАЛИДАЦИЯ captcha: API-ошибка на вакансии %s: %s "
-                    "captcha_url=%r handler=%r",
-                    vacancy.get("alternate_url"),
-                    type(ex).__name__,
-                    getattr(ex, "captcha_url", None),
-                    getattr(self.api_client, "captcha_handler", None),
-                )
                 logger.warning(ex)
             except (BadResponse, AIError) as ex:
                 logger.error(ex)
@@ -1522,8 +1497,6 @@ class Operation(BaseOperation):
                         f"Варианты:\n{options}\n"
                         f"Выбери ID правильного ответа. Пришли только ID."
                     )
-                    # ВАЛИДАЦИЯ: промпт для выбора ответа тоже без контекста пользователя
-                    logger.debug("ВАЛИДАЦИЯ промпт теста (выбор ID): %r", prompt)
                     ai_answer = self.cover_letter_ai.complete(prompt).strip()
                     # Ищем ID в ответе AI на случай лишнего текста
                     match = re.search(r"\d+", ai_answer)
@@ -1557,13 +1530,6 @@ class Operation(BaseOperation):
                     )
                 elif self.cover_letter_ai:
                     prompt = f"Ответь на вопрос: {question}"
-                    # ВАЛИДАЦИЯ: проверяем, содержит ли промпт контекст пользователя
-                    user_context = getattr(self, "_user_context", "") or ""
-                    logger.debug(
-                        "ВАЛИДАЦИЯ промпт теста (контекст пользователя = %s): %r",
-                        "ЕСТЬ" if user_context else "НЕТ",
-                        prompt,
-                    )
                     answer = self.cover_letter_ai.complete(prompt)
                     ## добавляем ответ AI на вопрос теста##
                     logger.debug("AI ответ= %r", answer)
@@ -1619,14 +1585,6 @@ class Operation(BaseOperation):
 
             captcha_state = self._captcha_state_from(data)
             if not captcha_state:
-                logger.debug(
-                    "ВАЛИДАЦИЯ captcha: отклик на тест %s без капчи, "
-                    "ключи=%s",
-                    vacancy_id,
-                    list(data)
-                    if isinstance(data, dict)
-                    else type(data).__name__,
-                )
                 return data
 
             logger.warning(

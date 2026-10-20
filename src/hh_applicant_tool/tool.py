@@ -731,16 +731,6 @@ class HHApplicantTool:
         return server
 
     def _solve_captcha(self, image_data: bytes) -> str:
-        # ВАЛИДАЦИЯ captcha: если эта строка есть в логе, картинку реально
-        # пытались распознать.
-        logger.debug(
-            "ВАЛИДАЦИЯ captcha: _solve_captcha вызван (use_ai=%s, kitty=%s, "
-            "sixel=%s, %d байт)",
-            self.use_ai,
-            self.use_kitty,
-            self.use_sixel,
-            len(image_data),
-        )
         if self.use_ai:
             # Алфавит ответа задаёт язык картинки: иначе кириллический
             # ответ уезжает туда, где hh.ru ждёт латиницу.
@@ -767,13 +757,6 @@ class HHApplicantTool:
     ) -> CaptchaSolution:
         """Если API сайта возвращает ответ с hhcaptcha.captchaState, то
         появляется всплывающее окно для ввода капчи"""
-        # ВАЛИДАЦИЯ captcha: маркер входа в решение капчи.
-        logger.debug(
-            "ВАЛИДАЦИЯ captcha: solve_captcha вызван (state=%.24s, "
-            "referer=%s)",
-            captcha_state,
-            referer_url,
-        )
         captcha_img = self.get_captcha_image(
             lang=lang,
             referer_url=referer_url,
@@ -875,10 +858,6 @@ class HHApplicantTool:
         lang = lang or self.captcha_lang
         target_url = urljoin(
             referer_url or HH_BASE_URL, "/captcha?lang=" + quote(lang)
-        )
-        logger.debug(
-            "ВАЛИДАЦИЯ captcha: get_captcha_image запрашивает %s",
-            target_url,
         )
         logger.debug(
             "Отправляем POST-запрос на %s для получения captcha key",
